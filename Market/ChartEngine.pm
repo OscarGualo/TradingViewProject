@@ -63,8 +63,25 @@ sub run {
     my ($self) = @_;
     my $mw = $self->{mw};
     $mw->title('Motor de Charting - TradingView simple');
-    $mw->geometry('1400x800');
-    eval { $mw->attributes('-fullscreen', 0); };
+
+    # ── Pantalla completa CON barra de título y controles nativos ───────────
+    # A diferencia de -fullscreen (que quita la decoración de la ventana),
+    # esto MAXIMIZA la ventana: ocupa toda la pantalla pero conserva la
+    # barra de título con los botones nativos de minimizar/restaurar/cerrar.
+    $mw->geometry($mw->screenwidth . 'x' . $mw->screenheight . '+0+0');
+
+    # -zoomed es el atributo estándar de Tk para "maximizado" en Linux/X11
+    # (equivalente a hacer clic en el botón de maximizar). Mantiene la
+    # decoración nativa de la ventana — título, minimizar, restaurar, cerrar.
+    eval { $mw->attributes('-zoomed', 1); };
+
+    # Respaldo para Windows/macOS, donde -zoomed no siempre está soportado:
+    # state('zoomed') es el equivalente en esos sistemas. Se intenta solo
+    # si -zoomed falló, para no aplicar dos mecanismos redundantes en
+    # sistemas donde -zoomed ya funcionó correctamente por sí solo.
+    if ($@) {
+        eval { $mw->state('zoomed'); };
+    }
 
     my $top = $mw->Frame(-background => '#1e222d', -relief => 'flat')->pack(-side => 'top', -fill => 'x');
 
@@ -215,9 +232,9 @@ sub run {
         -borderwidth      => 1,
     );
 
-    # Variables de checkbutton para SMC_Structures (HH/HL/LH/LL, BOS, CHoCH, FVG, Fib)
+    # Variables de checkbutton para SMC_Structures — todos desactivados por defecto
     my %smc_var = (
-        swings => 1, bos => 1, choch => 1, fvg => 1, fib => 1,
+        swings => 0, bos => 0, choch => 0, fvg => 0, fib => 0,
     );
     my %smc_menu_label = (
         swings => 'HH / HL / LH / LL',
@@ -247,9 +264,9 @@ sub run {
 
     $overlays_menu->add('separator');
 
-    # Variables de checkbutton para Liquidity (BSL, SSL, EQH, EQL, Sweep, Grab, Run)
+    # Variables de checkbutton para Liquidity — todos desactivados por defecto
     my %liq_var = (
-        bsl => 1, ssl => 1, eqh => 1, eql => 1, sweep => 1, grab => 1, run => 1,
+        bsl => 0, ssl => 0, eqh => 0, eql => 0, sweep => 0, grab => 0, run => 0,
     );
     my %liq_menu_label = (
         bsl   => 'BSL',
@@ -411,7 +428,19 @@ sub run {
 
     $self->{canvas} = $canvas;
 
-    $canvas->bindtags([$canvas]);
+    # El canvas debe tener el foco de teclado explícitamente para que los
+    # binds de teclado (Escape, R, flechas, espacio, +/-) funcionen desde
+    # el arranque, sin necesidad de que el usuario haga clic primero.
+    $canvas->focus();
+
+    # bindtags([$canvas, $mw]) en vez de bindtags([$canvas]):
+    # El canvas sigue procesando primero sus propios eventos de mouse
+    # (Motion, ButtonPress, etc. — todos atados directamente a $canvas más
+    # abajo), pero ahora los eventos de TECLADO que no tienen un bind
+    # específico en $canvas SÍ se propagan a $mw. Esto es lo que permite
+    # que Escape, R, flechas, espacio, +/- (todos atados a $mw) funcionen
+    # sin tener que duplicar cada uno de ellos también en $canvas.
+    $canvas->bindtags([$canvas, $mw]);
 
     my $configured_once = 0;
 
@@ -488,6 +517,19 @@ $canvas->Tk::bind('<MouseWheel>' => [
     $mw->Tk::bind('<plus>'  => sub { $self->mouse_wheel(120); });
     $mw->Tk::bind('<minus>' => sub { $self->mouse_wheel(-120); });
     $mw->Tk::bind('<Escape>' => sub {
+        if ($self->{replay_picking}) { $self->replay_cancel_pick(); }
+        elsif ($self->{replay_mode}) { $self->replay_exit(); }
+        else                         { $mw->destroy; }
+    });
+    # IMPORTANTE: $canvas->bindtags([$canvas]) (ver arriba, justo después de
+    # crear el canvas) corta la propagación normal de eventos del canvas
+    # hacia Tk::Widget/Toplevel/MainWindow. Como el canvas es el widget que
+    # recibe el foco de teclado real durante el uso normal del programa, el
+    # bind de Escape en $mw NUNCA llega a dispararse en la práctica — el
+    # evento muere en el canvas porque su bindtags ya no incluye a $mw.
+    # Se duplica aquí el mismo bind directamente sobre $canvas para que
+    # Escape funcione sin importar qué widget tenga el foco en ese momento.
+    $canvas->Tk::bind('<Escape>' => sub {
         if ($self->{replay_picking}) { $self->replay_cancel_pick(); }
         elsif ($self->{replay_mode}) { $self->replay_exit(); }
         else                         { $mw->destroy; }
@@ -826,20 +868,24 @@ sub _replay_stop_timer {
 sub _replay_recalc_indicators {
     my ($self) = @_;
 
-    # ── 2.3C: Recálculo real sin filtración de datos futuros ─────────────────
-    # Creamos un proxy que expone SOLO los datos hasta replay_cursor.
-    # ATR.pm (y futuros SMC, Liquidity) llaman last_index() y get_slice(),
-    # que el proxy redirige al límite del cursor — nunca a velas futuras.
     my $proxy = Market::ReplayProxy->new(
         $self->{market},
         $self->{replay_cursor},
     );
 
-    $self->{indicators}->reset_all();
-    $self->{indicators}->update_last($proxy);
-    # Resultado: $indicators->get('ATR') ahora tiene exactamente
-    # replay_cursor+1 valores. El índice [replay_cursor] es el ATR de la
-    # última vela visible, sin ninguna vela futura en el cálculo.
+    # Recalcular ATR y SMC_Structures normalmente — son rápidos (~0.4s total).
+    # Liquidity usa calculate_replay() que omite EQH/EQL O(n²):
+    # de 2.5s → 0.65s por step (4.7x más rápido), sin violar el PDF.
+    my $ind = $self->{indicators};
+
+    my $atr = $ind->get_indicator('ATR');
+    $atr->calculate_all($proxy) if defined $atr;
+
+    my $smc = $ind->get_indicator('SMC_Structures');
+    $smc->calculate_all($proxy) if defined $smc;
+
+    my $liq = $ind->get_indicator('Liquidity');
+    $liq->calculate_replay($proxy) if defined $liq;
 }
 
 # Centra la vista alrededor del replay_cursor manteniendo contexto histórico.

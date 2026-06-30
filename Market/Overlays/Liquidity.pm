@@ -48,14 +48,15 @@ sub new {
     my ($class, %args) = @_;
     my $self = {
         scale => Market::Panels::Scales->new(),
+        # Todos desactivados al arrancar — el usuario activa desde el menú.
         visible => {
-            bsl   => 1,
-            ssl   => 1,
-            eqh   => 1,
-            eql   => 1,
-            sweep => 1,
-            grab  => 1,
-            run   => 1,
+            bsl   => 0,
+            ssl   => 0,
+            eqh   => 0,
+            eql   => 0,
+            sweep => 0,
+            grab  => 0,
+            run   => 0,
         },
     };
     bless $self, $class;

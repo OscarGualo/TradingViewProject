@@ -59,14 +59,16 @@ sub new {
     my ($class, %args) = @_;
     my $self = {
         scale => Market::Panels::Scales->new(),
-        # Visibilidad individual por elemento — controlada desde el menú
-        # "Overlays" del ChartEngine (ver 3.5-B). Todo activo por defecto.
+        # Visibilidad individual — todos desactivados al arrancar.
+        # El usuario activa los que necesita desde el menú Overlays.
+        # Esto evita dibujar miles de elementos en el primer frame y
+        # mejora significativamente el tiempo de arranque y el draw().
         visible => {
-            swings => 1,
-            bos    => 1,
-            choch  => 1,
-            fvg    => 1,
-            fib    => 1,
+            swings => 0,
+            bos    => 0,
+            choch  => 0,
+            fvg    => 0,
+            fib    => 0,
         },
     };
     bless $self, $class;
