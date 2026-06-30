@@ -14,8 +14,12 @@ use warnings;
 # PUNTO 3.2 — BOS y CHoCH internal/external
 # PUNTO 3.3 — FVG (Fair Value Gap) con mitigación y desvanecimiento
 #
-# Pendiente para 3.4 (otro archivo, Liquidity.pm, usará helpers de este):
-#   - Fibonacci Retracement (se añade aquí mismo cuando llegue su turno)
+# Piezas del cronograma 29/06 (Tabla 4 del PDF) implementadas en este archivo:
+#   - Order Blocks (OB): última vela opuesta antes de un BOS
+#   - Support/Resistance: niveles horizontales de reacción repetida del precio
+#   - Trendlines/Channels: líneas conectando swings consecutivos del mismo tipo
+#   - "Near daily candle's body & wick": proximidad del precio actual a la
+#     vela diaria más reciente
 #
 # Sigue el mismo contrato que Market::Indicators::ATR para integrarse
 # sin cambios en IndicatorManager:
@@ -74,6 +78,37 @@ sub new {
 
         # Índice de la vela de FORMACIÓN -> fvg (acceso O(1) para overlays)
         fvgs_by_index => {},
+
+        # ── Order Blocks ────────────────────────────────────────────────────
+        # order_blocks: arrayref cronológico de hashrefs:
+        #   { index, direction, top, bottom, bos_index, mitigated_at }
+        #     index        => índice de la vela OB (última opuesta antes del BOS)
+        #     direction    => 'bullish' | 'bearish'
+        #     top, bottom  => rango de precio del OB (high/low de esa vela)
+        #     bos_index    => índice del BOS que originó este OB
+        #     mitigated_at => índice donde el precio volvió a tocar el OB, o undef
+        order_blocks => [],
+        order_blocks_by_index => {},
+
+        # ── Support / Resistance ────────────────────────────────────────────
+        # support_resistance: arrayref de hashrefs:
+        #   { price, kind, touches, first_index, last_index }
+        #     kind    => 'support' | 'resistance'
+        #     touches => arrayref de índices donde el precio reaccionó en este nivel
+        support_resistance => [],
+
+        # ── Trendlines / Channels ───────────────────────────────────────────
+        # trendlines: arrayref de hashrefs:
+        #   { kind, point1, point2, slope, intercept }
+        #     kind   => 'support' (conecta Swing Lows) | 'resistance' (Swing Highs)
+        #     point1, point2 => { index, price } — los dos swings que definen la línea
+        #     slope, intercept => y = slope*x + intercept, para extender la línea
+        trendlines => [],
+
+        # ── Near daily candle's body & wick ─────────────────────────────────
+        # daily_proximity: hashref con la referencia de la vela diaria más
+        # reciente y la posición del precio actual respecto a su cuerpo/mecha.
+        daily_proximity => undef,
     };
     bless $self, $class;
     return $self;
@@ -87,6 +122,11 @@ sub reset {
     $self->{events_by_index} = {};
     $self->{fvgs} = [];
     $self->{fvgs_by_index} = {};
+    $self->{order_blocks} = [];
+    $self->{order_blocks_by_index} = {};
+    $self->{support_resistance} = [];
+    $self->{trendlines} = [];
+    $self->{daily_proximity} = undef;
 }
 
 # values() devuelve el arrayref de swings — es el contrato esperado por
@@ -127,6 +167,32 @@ sub fvg_at {
 sub values_fvgs {
     my ($self) = @_;
     return $self->{fvgs};
+}
+
+# Devuelve el Order Block formado en una vela específica, o undef.
+sub order_block_at {
+    my ($self, $index) = @_;
+    return $self->{order_blocks_by_index}{$index};
+}
+
+sub values_order_blocks {
+    my ($self) = @_;
+    return $self->{order_blocks};
+}
+
+sub values_support_resistance {
+    my ($self) = @_;
+    return $self->{support_resistance};
+}
+
+sub values_trendlines {
+    my ($self) = @_;
+    return $self->{trendlines};
+}
+
+sub daily_proximity {
+    my ($self) = @_;
+    return $self->{daily_proximity};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +297,18 @@ sub calculate_all {
 
     # ── Paso 4: detección de Fair Value Gaps ─────────────────────────────────
     $self->_detect_fvg($data);
+
+    # ── Paso 5: Order Blocks (última vela opuesta antes de cada BOS) ────────
+    $self->_detect_order_blocks($data);
+
+    # ── Paso 6: Support / Resistance (niveles con reacción repetida) ────────
+    $self->_detect_support_resistance($data);
+
+    # ── Paso 7: Trendlines / Channels (líneas entre swings consecutivos) ────
+    $self->_detect_trendlines();
+
+    # ── Paso 8: proximidad a la vela diaria más reciente ─────────────────────
+    $self->_calc_daily_proximity($market_data, $data);
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -440,6 +518,270 @@ sub _detect_fvg {
     }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _detect_order_blocks — "OB: Inside Order Blocks" (cronograma 29/06)
+#
+# Un Order Block es la última vela de dirección OPUESTA a un movimiento
+# impulsivo, justo antes de que ese movimiento confirme un BOS. Representa
+# la zona donde "smart money" habría acumulado posiciones antes de mover
+# el precio — definición estándar ICT/LuxAlgo:
+#
+#   OB alcista (bullish): para un BOS alcista (direction='up'), es la
+#   última vela BAJISTA (close < open) en el rango [level_index, event_index)
+#   del evento BOS. Su rango de precio es [low, high] de esa vela.
+#
+#   OB bajista (bearish): para un BOS bajista (direction='down'), es la
+#   última vela ALCISTA (close > open) en ese mismo rango.
+#
+# Mitigación: el OB se considera mitigado en la primera vela posterior al
+# BOS cuyo rango vuelve a tocar el rango de precio del OB — el precio
+# "regresó a recoger" esa liquidez.
+#
+# Solo se generan Order Blocks a partir de eventos BOS (no CHoCH), ya que
+# el OB representa el origen de una continuación de tendencia confirmada.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _detect_order_blocks {
+    my ($self, $data) = @_;
+    my $n = scalar @$data;
+
+    for my $ev (@{ $self->{events} }) {
+        next unless $ev->{type} eq 'BOS';
+
+        my $is_bullish_bos = ($ev->{direction} eq 'up');
+        my $search_start    = $ev->{level_index};
+        my $search_end      = $ev->{index};
+        next if $search_end <= $search_start;
+
+        # Buscar hacia atrás desde el evento la última vela de dirección opuesta
+        my $ob_index;
+        for (my $j = $search_end - 1; $j >= $search_start; $j--) {
+            my $c = $data->[$j];
+            my $is_opposite = $is_bullish_bos
+                ? ($c->{close} < $c->{open})    # vela bajista para OB alcista
+                : ($c->{close} > $c->{open});   # vela alcista para OB bajista
+            if ($is_opposite) {
+                $ob_index = $j;
+                last;
+            }
+        }
+        next unless defined $ob_index;
+
+        my $ob_candle = $data->[$ob_index];
+        my $ob = {
+            index        => $ob_index,
+            direction    => $is_bullish_bos ? 'bullish' : 'bearish',
+            top          => $ob_candle->{high},
+            bottom       => $ob_candle->{low},
+            bos_index    => $ev->{index},
+            mitigated_at => undef,
+        };
+
+        # Buscar mitigación: primera vela posterior al BOS que vuelve a
+        # tocar el rango del Order Block.
+        for (my $j = $ev->{index} + 1; $j < $n; $j++) {
+            my $c = $data->[$j];
+            if ($c->{low} <= $ob->{top} && $c->{high} >= $ob->{bottom}) {
+                $ob->{mitigated_at} = $j;
+                last;
+            }
+        }
+
+        push @{ $self->{order_blocks} }, $ob;
+        $self->{order_blocks_by_index}{$ob_index} = $ob;
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _detect_support_resistance — "Support/Resistence: below support or above
+# resistance levels" (cronograma 29/06)
+#
+# Agrupa los Swing Highs en niveles de Resistencia y los Swing Lows en
+# niveles de Soporte: cuando varios swings del mismo tipo caen dentro de
+# una tolerancia de precio entre sí (misma idea de EQH/EQL pero acumulando
+# TODOS los toques, no solo pares), se consolidan en un único nivel con
+# la lista de índices donde el precio reaccionó ahí.
+#
+# Solo se reportan niveles con 2 o más toques — un solo swing aislado no
+# es un nivel de "soporte/resistencia", es solo un Swing Point normal.
+#
+# Tolerancia: se usa un porcentaje fijo simple (0.15% del precio del
+# primer toque) para no depender del ATR de Liquidity.pm — este archivo
+# se mantiene autocontenido según la Tabla 1 del PDF.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _detect_support_resistance {
+    my ($self, $data) = @_;
+    my $tolerance_pct = 0.0015;   # 0.15%
+
+    for my $kind_info (
+        { type => 'high', kind => 'resistance' },
+        { type => 'low',  kind => 'support' },
+    ) {
+        my @pivots = grep { $_->{type} eq $kind_info->{type} } @{ $self->{swings} };
+        my @used;   # índices de @pivots ya asignados a un nivel
+
+        for (my $pi = 0; $pi <= $#pivots; $pi++) {
+            next if $used[$pi];
+
+            my $base_price  = $pivots[$pi]{price};
+            my $tolerance   = $base_price * $tolerance_pct;
+            my @touches     = ($pivots[$pi]{index});
+            my $sum_price   = $base_price;
+            my $count       = 1;
+
+            for (my $pj = $pi + 1; $pj <= $#pivots; $pj++) {
+                next if $used[$pj];
+                if (abs($pivots[$pj]{price} - $base_price) <= $tolerance) {
+                    push @touches, $pivots[$pj]{index};
+                    $sum_price += $pivots[$pj]{price};
+                    $count++;
+                    $used[$pj] = 1;
+                }
+            }
+
+            next if $count < 2;   # exigir al menos 2 toques para ser nivel
+
+            @touches = sort { $a <=> $b } @touches;
+            push @{ $self->{support_resistance} }, {
+                price       => $sum_price / $count,   # precio promedio del nivel
+                kind        => $kind_info->{kind},
+                touches     => \@touches,
+                first_index => $touches[0],
+                last_index  => $touches[-1],
+            };
+        }
+    }
+
+    # Ordenar cronológicamente por el primer toque, para consistencia visual.
+    @{ $self->{support_resistance} } =
+        sort { $a->{first_index} <=> $b->{first_index} } @{ $self->{support_resistance} };
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _detect_trendlines — "Trendlines/Channels: below or above" (cronograma 29/06)
+#
+# Conecta SWINGS CONSECUTIVOS del mismo tipo con una línea recta:
+#   - Línea de resistencia: conecta cada par de Swing Highs consecutivos
+#     (la línea queda "arriba" del precio — channel superior).
+#   - Línea de soporte: conecta cada par de Swing Lows consecutivos
+#     (la línea queda "abajo" del precio — channel inferior).
+#
+# Cada trendline se expresa como y = slope*x + intercept (en términos de
+# índice de vela como x y precio como y) para que el Overlay pueda
+# extender la línea más allá del segundo punto y dibujar el canal completo.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _detect_trendlines {
+    my ($self) = @_;
+
+    for my $type ('high', 'low') {
+        my @pivots = grep { $_->{type} eq $type } @{ $self->{swings} };
+        next if @pivots < 2;
+
+        for (my $i = 0; $i < $#pivots; $i++) {
+            my $p1 = $pivots[$i];
+            my $p2 = $pivots[$i + 1];
+
+            my $dx = $p2->{index} - $p1->{index};
+            next if $dx == 0;
+
+            my $slope     = ($p2->{price} - $p1->{price}) / $dx;
+            my $intercept = $p1->{price} - $slope * $p1->{index};
+
+            push @{ $self->{trendlines} }, {
+                kind      => ($type eq 'high') ? 'resistance' : 'support',
+                point1    => { index => $p1->{index}, price => $p1->{price} },
+                point2    => { index => $p2->{index}, price => $p2->{price} },
+                slope     => $slope,
+                intercept => $intercept,
+            };
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _calc_daily_proximity — "near daily candle's body & wick" (cronograma 29/06)
+#
+# Calcula la posición del PRECIO ACTUAL (cierre de la última vela visible)
+# respecto al cuerpo y la mecha de la vela DIARIA más reciente. Útil como
+# referencia visual de "qué tan cerca está el precio de zonas relevantes
+# del día" — exactamente lo que TradingView/LuxAlgo muestran con niveles
+# "Previous Day High/Low" combinados con el cuerpo de la vela.
+#
+# Requiere acceso al MarketData completo (no solo al slice del TF activo)
+# para leer la temporalidad 'D' independientemente de en qué TF esté
+# navegando el usuario — mismo patrón que el volumen multi-temporal del
+# PDF 4.4 en Liquidity.pm.
+#
+# Resultado almacenado en daily_proximity:
+#   {
+#     daily_index,        # índice de la vela diaria de referencia
+#     body_top, body_bottom,    # max/min de open y close de esa vela diaria
+#     wick_top, wick_bottom,    # high/low de esa vela diaria
+#     current_price,       # close de la última vela visible en el TF activo
+#     zone,                 # 'above_wick' | 'in_upper_wick' | 'in_body' |
+#                            # 'in_lower_wick' | 'below_wick'
+#     distance_to_body,     # distancia en precio al cuerpo más cercano
+#   }
+# ─────────────────────────────────────────────────────────────────────────────
+sub _calc_daily_proximity {
+    my ($self, $market_data, $data) = @_;
+    return unless @$data;
+
+    my $daily = eval { $market_data->get_tf_data('D') };
+    return unless $daily && @$daily;
+
+    my $current_price = $data->[-1]{close};
+    my $current_epoch = $data->[-1]{epoch};
+
+    # Encontrar la vela diaria más reciente cuyo epoch sea <= la vela actual
+    my $ref_candle;
+    my $ref_index;
+    for my $i (0 .. $#$daily) {
+        if ($daily->[$i]{epoch} <= $current_epoch) {
+            $ref_candle = $daily->[$i];
+            $ref_index  = $i;
+        } else {
+            last;
+        }
+    }
+    return unless defined $ref_candle;
+
+    my $body_top    = $ref_candle->{open} > $ref_candle->{close} ? $ref_candle->{open}  : $ref_candle->{close};
+    my $body_bottom = $ref_candle->{open} > $ref_candle->{close} ? $ref_candle->{close} : $ref_candle->{open};
+    my $wick_top    = $ref_candle->{high};
+    my $wick_bottom = $ref_candle->{low};
+
+    my $zone;
+    my $distance_to_body;
+
+    if ($current_price > $wick_top) {
+        $zone = 'above_wick';
+        $distance_to_body = $current_price - $body_top;
+    } elsif ($current_price > $body_top) {
+        $zone = 'in_upper_wick';
+        $distance_to_body = $current_price - $body_top;
+    } elsif ($current_price >= $body_bottom) {
+        $zone = 'in_body';
+        $distance_to_body = 0;
+    } elsif ($current_price >= $wick_bottom) {
+        $zone = 'in_lower_wick';
+        $distance_to_body = $body_bottom - $current_price;
+    } else {
+        $zone = 'below_wick';
+        $distance_to_body = $body_bottom - $current_price;
+    }
+
+    $self->{daily_proximity} = {
+        daily_index       => $ref_index,
+        body_top          => $body_top,
+        body_bottom       => $body_bottom,
+        wick_top          => $wick_top,
+        wick_bottom       => $wick_bottom,
+        current_price     => $current_price,
+        zone              => $zone,
+        distance_to_body  => $distance_to_body,
+    };
+}
+
 # Helper interno: registra un evento BOS/CHoCH en las dos estructuras de
 # almacenamiento (lista cronológica + índice por vela).
 sub _push_event {
@@ -544,6 +886,40 @@ sub active_fvgs_at {
             $_->{index} <= $index
             && (!defined $_->{mitigated_at} || $_->{mitigated_at} > $index)
         } @{ $self->{fvgs} }
+    ];
+}
+
+# Order Blocks dentro de un rango — su "vida visual" intersecta [start,end]
+# igual criterio que fvgs_in_range: relevante mientras no mitigado, o si
+# la mitigación ocurrió dentro/después del rango visible.
+sub order_blocks_in_range {
+    my ($self, $start, $end) = @_;
+    return [
+        grep {
+            $_->{index} <= $end
+            && (!defined $_->{mitigated_at} || $_->{mitigated_at} >= $start)
+        } @{ $self->{order_blocks} }
+    ];
+}
+
+# Niveles de Support/Resistance cuyo primer toque cae dentro de [start,end]
+# o cuyo último toque sigue siendo posterior a start (nivel "vivo" en la
+# ventana visible).
+sub support_resistance_in_range {
+    my ($self, $start, $end) = @_;
+    return [
+        grep { $_->{first_index} <= $end && $_->{last_index} >= $start }
+        @{ $self->{support_resistance} }
+    ];
+}
+
+# Trendlines cuyo segmento [point1.index, point2.index] intersecta el
+# rango visible [start,end].
+sub trendlines_in_range {
+    my ($self, $start, $end) = @_;
+    return [
+        grep { $_->{point1}{index} <= $end && $_->{point2}{index} >= $start }
+        @{ $self->{trendlines} }
     ];
 }
 

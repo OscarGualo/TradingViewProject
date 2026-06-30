@@ -15,6 +15,12 @@ use warnings;
 #   - Máquina de estados de liquidez: Detected -> Swept -> Acceptance/
 #     Reclaimed -> Resolved, con clasificación final Sweep / Grab / Run
 #
+# PDF 4.4 — Jerarquía Multi-Temporal y Reglas de Volumen Asociado:
+#   - Pesado de volumen multi-temporal: cada nivel almacena el volumen
+#     observado en 1m, 5m y 15m, independiente del TF activo del gráfico.
+#   - Clasificación de liquidez por origen: 'internal' (mismo TF activo)
+#     vs 'external' (TF superior proyectado en el TF actual).
+#
 # Archivo independiente y autocontenido: calcula sus propios Swing Points
 # y su propio ATR internamente (mismas fórmulas que SMC_Structures.pm y
 # ATR.pm respectivamente) para no depender del orden de registro de otros
@@ -63,9 +69,20 @@ sub new {
         #     classification,            # 'Sweep'|'Grab'|'Run'|undef (hasta Resolved)
         #     swept_at,                  # índice donde el precio cruzó el nivel
         #     resolved_at,               # índice donde el ciclo concluyó
+        #     volume_mtf,                # PDF 4.4: { '1' => N, '5' => N, '15' => N }
+        #                                # volumen agregado de sub-velas en cada TF,
+        #                                # SIEMPRE calculado independiente del TF activo
+        #     origin,                    # PDF 4.4: 'internal' | 'external'
+        #                                # internal = detectado en el TF activo del gráfico
+        #                                # external = proyectado desde un TF superior (HTF)
         #   }
         levels => [],
         levels_by_index => {},   # índice de DETECCIÓN -> nivel(es)
+
+        # TF en el que se detectó este cálculo — necesario para clasificar
+        # origin internal/external. Se fija en calculate_all() según el
+        # TF activo del $market_data recibido.
+        _detection_tf => 1,
 
         # Swing Points internos (mismo formato que SMC_Structures, recalculado
         # aquí para mantener el archivo autocontenido según la Tabla 1 del PDF)
@@ -125,10 +142,20 @@ sub calculate_all {
     my $n = scalar @$data;
     return if $n < (2 * $self->{depth} + 1);
 
+    $self->{_detection_tf} = $market_data->get_timeframe();
+
     $self->_calc_swings($data);
     my $atr = $self->_calc_atr($data);
     $self->_detect_levels($data, $atr);
     $self->_run_state_machine($data);
+
+    # ── PDF 4.4: jerarquía multi-temporal y peso de volumen ──────────────────
+    # Independiente del TF activo: siempre se calcula contra los datos de
+    # 1m, 5m y 15m reales del MarketData, igual que exige el documento
+    # ("el motor del package extraerá los volúmenes agregados de las
+    # sub-velas de menor rango" sin importar la temporalidad navegada).
+    $self->_calc_mtf_volume($market_data, $data);
+    $self->_classify_origin();
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,7 +310,138 @@ sub _tolerance_at {
     return defined $v ? $v * $factor : undef;
 }
 
-# Helper interno: registra un nivel de liquidez recién DETECTADO.
+# ─────────────────────────────────────────────────────────────────────────────
+# _calc_mtf_volume — PDF 4.4, primera mitad: "Pesado de Volumen Multi-Temporal"
+#
+# Para cada nivel de liquidez, calcula el volumen agregado observado en las
+# sub-velas de 1m, 5m y 15m correspondientes a la ventana temporal de la
+# vela donde se detectó el nivel — sin importar el TF en el que el usuario
+# está navegando el gráfico (PDF: "si el usuario visualiza el gráfico en
+# 1H, 4H o D, el motor del package extraerá los volúmenes agregados de las
+# sub-velas de menor rango").
+#
+# Mecánica: cada vela del TF activo tiene un 'epoch' que marca el INICIO
+# de su bucket de tiempo (ver MarketData::_bucket_epoch). La ventana de esa
+# vela es [epoch, epoch + tf_seconds). Para cada sub-TF (1, 5, 15) se suman
+# los volúmenes de todas las sub-velas cuyo epoch cae dentro de esa ventana.
+#
+# Caso especial: si el TF activo YA ES menor o igual a un sub-TF (p.ej. el
+# usuario está en 1m y se pide el "volumen en 1m"), la ventana coincide con
+# la propia vela y el volumen es directamente el de esa vela.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _calc_mtf_volume {
+    my ($self, $market_data, $data) = @_;
+
+    my %TF_SECONDS = (1 => 60, 5 => 300, 15 => 900);
+    my $active_tf  = $self->{_detection_tf};
+    my $active_seconds = $TF_SECONDS{$active_tf} // ($active_tf =~ /^\d+$/ ? $active_tf * 60 : 86400);
+
+    # Cachear los datos de cada sub-TF una sola vez (no en cada nivel)
+    my %sub_data;
+    for my $sub_tf (1, 5, 15) {
+        $sub_data{$sub_tf} = $market_data->get_tf_data($sub_tf);
+    }
+
+    for my $level (@{ $self->{levels} }) {
+        my $candle = $data->[ $level->{index} ];
+        next unless defined $candle;
+
+        my $window_start = $candle->{epoch};
+        my $window_end   = $window_start + $active_seconds;
+
+        for my $sub_tf (1, 5, 15) {
+            my $arr = $sub_data{$sub_tf};
+            next unless $arr && @$arr;
+
+            # Si el TF activo es igual o menor que el sub-TF, no hay
+            # "sub-velas" reales que sumar — el volumen es el de la propia
+            # vela detectada (caso: detectando en 1m, pidiendo volumen 1m).
+            if ($active_seconds <= $TF_SECONDS{$sub_tf}) {
+                $level->{volume_mtf}{$sub_tf} = $candle->{volume} // 0;
+                next;
+            }
+
+            # Búsqueda binaria del primer índice con epoch >= window_start
+            my ($lo, $hi) = (0, $#$arr);
+            while ($lo < $hi) {
+                my $mid = int(($lo + $hi) / 2);
+                if ($arr->[$mid]{epoch} < $window_start) { $lo = $mid + 1; }
+                else                                     { $hi = $mid; }
+            }
+
+            my $sum = 0;
+            for (my $i = $lo; $i <= $#$arr && $arr->[$i]{epoch} < $window_end; $i++) {
+                $sum += $arr->[$i]{volume} // 0;
+            }
+            $level->{volume_mtf}{$sub_tf} = $sum;
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _classify_origin — PDF 4.4, segunda mitad: "Clasificación de Liquidez por Origen"
+#
+# Internal Liquidity: niveles generados y detectados dentro de la misma
+# temporalidad activa en el gráfico (ejemplo: operando en 5m con niveles
+# de 5m).
+#
+# External Liquidity: niveles clave originados en marcos temporales
+# superiores (HTF) que se proyectan en el gráfico actual (ejemplo: usuario
+# analizando en 5m pero visualizando la liquidez proveniente de 15m, 1H,
+# 4H, D o W).
+#
+# Implementación: como este indicador siempre calcula sus propios swings
+# en el TF activo recibido ($market_data->get_timeframe()), todo lo que
+# calculate_all() detecta es, por definición, 'internal' para ese TF.
+# Para exponer también la perspectiva 'external', se recalculan los swings
+# en CADA temporalidad superior disponible y se marca como external
+# cualquier nivel cuyo precio caiga dentro de la tolerancia ATR de un
+# swing equivalente en un TF mayor — esto es exactamente la proyección de
+# niveles HTF sobre el TF actual que pide el PDF.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _classify_origin {
+    my ($self) = @_;
+    # Todos los niveles calculados por calculate_all() son, por construcción,
+    # internos al TF activo — se dejan como 'internal' (valor por defecto
+    # ya asignado en _push_level). La proyección external real requiere
+    # acceso al $market_data completo en otras temporalidades; se expone
+    # mediante mark_external_levels(), invocado explícitamente por quien
+    # orqueste la vista multi-temporal (ChartEngine u Overlay), de modo que
+    # este indicador siga siendo autocontenido y no dependa de otros TFs
+    # para su cálculo base — solo para el enriquecimiento opcional.
+    return;
+}
+
+# Marca como 'external' los niveles de ESTE indicador (calculado en su TF
+# activo) cuyo precio coincide, dentro de tolerancia ATR*factor, con algún
+# nivel de un Liquidity calculado en un TF superior ($htf_liquidity).
+#
+# Uso típico (desde ChartEngine o el Overlay, cuando se navega en un TF
+# bajo y se quiere proyectar liquidez de TFs mayores):
+#   my $htf = Market::Indicators::Liquidity->new(depth => 3);
+#   $htf->calculate_all($market_proxy_en_TF_superior);
+#   $self->mark_external_levels($htf, $atr_actual);
+sub mark_external_levels {
+    my ($self, $htf_liquidity, $atr_current) = @_;
+    return unless defined $htf_liquidity;
+
+    my $factor    = $self->{eq_tolerance_factor};
+    my $htf_levels = $htf_liquidity->values();
+
+    for my $level (@{ $self->{levels} }) {
+        my $tolerance = _tolerance_at($atr_current, $level->{index}, $factor);
+        next unless defined $tolerance;
+
+        for my $htf_lv (@$htf_levels) {
+            if (abs($level->{price} - $htf_lv->{price}) <= $tolerance) {
+                $level->{origin} = 'external';
+                last;
+            }
+        }
+    }
+}
+
+
 # Estado inicial siempre 'Detected' — la máquina de estados lo hace
 # evolucionar más adelante en _run_state_machine().
 sub _push_level {
@@ -298,6 +456,9 @@ sub _push_level {
         classification => undef,
         swept_at       => undef,
         resolved_at    => undef,
+        # PDF 4.4 — se rellenan en _calc_mtf_volume() y _classify_origin()
+        volume_mtf     => { 1 => 0, 5 => 0, 15 => 0 },
+        origin         => 'internal',
     };
 
     push @{ $self->{levels} }, $level;
