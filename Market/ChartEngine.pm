@@ -921,6 +921,18 @@ sub _replay_recalc_indicators {
     $liq->calculate_replay($wproxy) if defined $liq;
 
     # ATR: intencionalmente NO se recalcula (ver comentario arriba).
+
+    # ZigZagMTF y ZigZagVolume: SÍ se recalculan en cada paso de replay.
+    # El tramo tentativo debe actualizarse con cada nueva vela para que
+    # el zigzag siga el precio en tiempo real (como TradingView en replay):
+    # la línea punteada crece vela a vela hasta que hay suficiente reversión
+    # para confirmar el nuevo pivote. Sin este recálculo el tentativo queda
+    # fijo al precio de cuando se entró al replay.
+    my $zzm = $ind->get_indicator('ZigZagMTF');
+    $zzm->calculate_all($wproxy) if defined $zzm;
+
+    my $zzv = $ind->get_indicator('ZigZagVolume');
+    $zzv->calculate_all($wproxy) if defined $zzv;
 }
 
 # Centra la vista alrededor del replay_cursor manteniendo contexto histórico.
