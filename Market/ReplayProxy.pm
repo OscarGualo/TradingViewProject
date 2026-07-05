@@ -64,7 +64,9 @@ sub get_timeframe   { $_[0]->{_market}->get_timeframe(); }
 sub get_timestamp   { $_[0]->{_market}->get_timestamp($_[1]); }
 sub get_data        { $_[0]->{_market}->get_data(); }
 sub available_timeframes { $_[0]->{_market}->available_timeframes(); }
-sub build_tf_candles { $_[0]->{_market}->build_tf_candles($_[1]); }
+sub build_tf_candles  { $_[0]->{_market}->build_tf_candles($_[1]); }
+# get_warmup_slice: velas previas al inicio de la ventana (para warm-up de ZZ)
+sub get_warmup_slice  { return []; }  # ReplayProxy: ya tiene toda la historia en get_slice
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -117,7 +119,15 @@ sub get_tf_slice         { $_[0]->{_market}->get_tf_slice($_[1], $_[2], $_[3]); 
 sub get_timestamp        { $_[0]->{_market}->get_timestamp($_[0]->{_base} + $_[1]); }
 sub get_data             { $_[0]->{_market}->get_data(); }
 sub available_timeframes { $_[0]->{_market}->available_timeframes(); }
-sub build_tf_candles { $_[0]->{_market}->build_tf_candles($_[1]); }
+sub build_tf_candles  { $_[0]->{_market}->build_tf_candles($_[1]); }
+# get_warmup_slice: velas previas a base_index para warm-up del ZigZag
+sub get_warmup_slice {
+    my ($self, $n) = @_;
+    my $base = $self->{_base};
+    return [] unless $base > 0;
+    my $start = $base > $n ? $base - $n : 0;
+    return $self->{_market}->get_slice($start, $base - 1);
+}
 
 
 1;

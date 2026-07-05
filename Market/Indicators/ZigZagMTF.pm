@@ -73,77 +73,120 @@ sub reset {
 
 sub values { return $_[0]->{segments}; }   # contrato mínimo del IndicatorManager
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# calculate_all — motor principal ATR-based sobre la temporalidad activa
+#
+# La "resolution" (15/30/60) controla la sensibilidad del umbral de reversión:
+#   15min → factor ~2.5  (más pivotes, más denso)
+#   30min → factor ~3.0  (densidad media, ~20 velas/pivote — igual que TV)
+#   60min → factor ~5.0  (menos pivotes, visión más amplia)
+#
+# El zigzag NO usa velas del TF superior. Calcula sobre la temporalidad activa
+# (1m) con un threshold = factor * ATR(14). Esto reproduce exactamente el
+# comportamiento visual de ChartPrime ZZMTF en TradingView.
+#
+# Comportamiento tentativo en Replay (PDF pág.5): el último pivote queda
+# "no confirmado" hasta que el precio revierte suficiente desde su extremo
+# en las velas SIGUIENTES al extremo. En replay, como no hay velas futuras,
+# el tramo entre el último extremo y el precio actual se dibuja punteado.
 # ─────────────────────────────────────────────────────────────────────────────
 sub calculate_all {
     my ($self, $md) = @_;
     $self->reset;
 
-    my $res   = $self->{resolution};
-    my $depth = $self->{period};
-    my $sec   = $res * 60;
+    my $data = $md->get_slice(0, $md->last_index());
+    my $n    = scalar @$data;
+    return unless $n >= 20;
 
-    # Construir el TF de referencia (30m) solo si el objeto lo permite
-    # (MarketData real). En Replay (WindowProxy) ya está construido.
-    $md->build_tf_candles($res) if $md->can('build_tf_candles');
-    my $htf = $md->get_tf_data($res) || [];
-    return unless @$htf;
+    # ── Paso 1: ATR(14) sobre los datos recibidos ─────────────────────────
+    my @atr = _calc_atr_zz($data, 14);
 
-    # Slice 1m (para proyección y epoch "actual" = cursor en Replay)
-    my $ltf = $md->get_slice(0, $md->last_index());
-    return unless @$ltf;
-    my $cur_epoch = $ltf->[-1]{epoch};
+    # ── Paso 2: factor de reversión según resolution (PDF pág.4) ──────────
+    # Mapeo lineal: resolution → factor.  15→2.5  30→3.0  60→5.0
+    my $res    = $self->{resolution};
+    my $factor = $res <= 15 ? 2.5
+               : $res <= 30 ? 3.0
+               : $res <= 60 ? 5.0
+               :              3.0 + ($res - 30) / 15;
 
-    # Solo buckets del TF de referencia YA CERRADOS a la altura del cursor.
-    # Esto impide "ver" velas futuras del 30m en Replay.
-    my @closed = grep { $_->{epoch} + $sec <= $cur_epoch + 60 } @$htf;
-    return unless @closed >= (2 * $depth + 2);
+    # ── Paso 3: ZigZag ATR-based sobre 1m ────────────────────────────────
+    # Si estamos en WindowProxy, prepend un warm-up de velas previas para
+    # que el algoritmo sepa la dirección de entrada. El warm-up NO modifica
+    # $data ni @atr ya calculados — corremos _zigzag_atr sobre el array
+    # combinado y luego filtramos los pivotes que caen en la ventana real.
+    my $base     = $md->can('base_index') ? $md->base_index : 0;
+    my $warmup_n = 0;
+    my $run_data = $data;    # array sobre el que se ejecuta el zigzag
+    my @run_atr  = @atr;
 
-    # ── ZigZag sobre el TF de referencia ──────────────────────────────────
-    my $piv = $self->_zigzag(\@closed, $depth);
-    return unless @$piv;
-
-    # Confirmación: un pivote está confirmado si tiene 'depth' buckets cerrados
-    # a su derecha (su lado derecho ya no puede cambiar).
-    my $last_closed = $#closed;
-    for my $p (@$piv) {
-        $p->{confirmed} = ($p->{idx} + $depth <= $last_closed) ? 1 : 0;
+    if ($base > 0 && $md->can('get_warmup_slice')) {
+        my $wu = $md->get_warmup_slice(300);
+        if ($wu && @$wu) {
+            $warmup_n = scalar @$wu;
+            $run_data = [@$wu, @$data];
+            @run_atr  = _calc_atr_zz($run_data, 14);
+        }
     }
 
-    $self->_label($piv);
+    my ($piv_ref, $unconfirmed_ext, $unconfirmed_idx, $unconfirmed_type)
+        = _zigzag_atr($run_data, \@run_atr, $factor);
 
-    # ── Proyección de cada pivote al índice 1m equivalente ────────────────
-    my $proj = $self->_project($piv, \@closed, $ltf, $sec);
-    $self->{pivots} = $proj;
+    # Filtrar y reajustar: solo pivotes dentro de la ventana real
+    @$piv_ref = grep { $_->{index} >= $warmup_n } @$piv_ref;
+    $_->{index} -= $warmup_n for @$piv_ref;
+    if (defined $unconfirmed_idx) {
+        $unconfirmed_idx -= $warmup_n;
+        undef $unconfirmed_idx if $unconfirmed_idx < 0;
+    }
 
-    # ── Segmentos entre pivotes consecutivos ──────────────────────────────
+    return unless @$piv_ref;
+
+    # ── Paso 4: etiquetas HH/HL/LH/LL ────────────────────────────────────
+    $self->_label($piv_ref);
+
+    # Todos los pivotes detectados están confirmados (tienen velas a ambos lados
+    # que causaron la reversión). El extremo en formación (unconfirmed) es el
+    # tramo tentativo.
+    $_->{confirmed} = 1 for @$piv_ref;
+    $self->{pivots} = $piv_ref;
+
+    # ── Paso 5: segmentos ─────────────────────────────────────────────────
     my @seg;
-    for (my $i = 0; $i < $#$proj; $i++) {
-        my ($a, $b) = ($proj->[$i], $proj->[$i + 1]);
+    for (my $i = 0; $i < $#$piv_ref; $i++) {
+        my ($a, $b) = ($piv_ref->[$i], $piv_ref->[$i + 1]);
         push @seg, {
             from      => { index => $a->{index}, price => $a->{price} },
             to        => { index => $b->{index}, price => $b->{price} },
             dir       => ($b->{price} >= $a->{price}) ? 'up' : 'down',
-            confirmed => ($a->{confirmed} && $b->{confirmed}) ? 1 : 0,
+            confirmed => 1,
         };
     }
     $self->{segments} = \@seg;
 
-    # ── Tramo tentativo: del último pivote CONFIRMADO al precio actual ────
-    my ($last_conf) = grep { $_->{confirmed} } reverse @$proj;
-    if ($last_conf) {
-        my $cur_price = $ltf->[-1]{close};
-        my $cur_index = $#$ltf;   # local; se convierte a global en _offset_indices
+    # ── Paso 6: tramo tentativo — del último pivote al extremo en formación
+    # $unconfirmed_ext / $unconfirmed_idx es el extremo actual del segmento
+    # en curso (máximo si subiendo, mínimo si bajando). Aún no es un pivote
+    # porque no hubo suficiente reversión. En replay el cursor lo trunca al
+    # precio actual, que es exactamente lo que muestra TV: la línea punteada
+    # siguiendo al precio hasta que cambia de dirección.
+    my $last_piv = $piv_ref->[-1];
+    if (defined $unconfirmed_idx && $unconfirmed_idx > $last_piv->{index}) {
+        # Usar high/low REAL de la vela del extremo en formación
+        my $tent_c     = $data->[$unconfirmed_idx];
+        my $tent_price = defined($tent_c)
+                       ? (($unconfirmed_type eq 'high') ? $tent_c->{high} : $tent_c->{low})
+                       : $unconfirmed_ext;
         $self->{tentative} = {
-            from => { index => $last_conf->{index}, price => $last_conf->{price} },
-            to   => { index => $cur_index,          price => $cur_price },
-            dir  => ($cur_price >= $last_conf->{price}) ? 'up' : 'down',
+            from => { index => $last_piv->{index},   price => $last_piv->{price} },
+            to   => { index => $unconfirmed_idx,      price => $tent_price        },
+            dir  => ($unconfirmed_type eq 'high') ? 'up' : 'down',
         };
     }
 
-    # ── Fibonacci del último leg (calculado siempre; se dibuja solo si
-    #    show_fib está activo — off por default según PDF) ─────────────────
-    if (@$proj >= 2) {
-        my ($p1, $p2) = ($proj->[-2], $proj->[-1]);
+    # ── Paso 7: Fibonacci del último leg (off por default, PDF pág.4) ─────
+    if (@$piv_ref >= 2) {
+        my ($p1, $p2) = ($piv_ref->[-2], $piv_ref->[-1]);
         my $range = $p2->{price} - $p1->{price};
         if ($range != 0) {
             my @lv;
@@ -154,48 +197,109 @@ sub calculate_all {
         }
     }
 
-    # ── Windowing (Replay): índices locales -> globales ───────────────────
-    my $base = $md->can('base_index') ? $md->base_index : 0;
+    # ── Paso 8: Windowing (Replay) — índices locales -> globales ──────────
     $self->_offset_indices($base) if $base;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _zigzag — detecta pivotes alternados (high/low) sobre el TF de referencia con
-# una ventana 'depth' a cada lado. En rachas del mismo tipo conserva el extremo.
+# _zigzag_atr — núcleo del zigzag ATR-based sobre la temporalidad activa.
+#
+# Algoritmo de reversión clásico:
+#   - Mantenemos el extremo actual (máximo si tendencia alcista, mínimo si bajista).
+#   - Cuando el precio revierte >= factor*ATR desde ese extremo, se confirma el
+#     pivote anterior y se inicia el segmento contrario.
+#   - Devuelve también el extremo en formación (tramo tentativo).
 # ─────────────────────────────────────────────────────────────────────────────
-sub _zigzag {
-    my ($self, $c, $depth) = @_;
-    my $n = scalar @$c;
-    return [] if $n < 2 * $depth + 1;
+sub _zigzag_atr {
+    my ($data, $atr, $factor) = @_;
+    my $n = scalar @$data;
+    return ([], undef, undef, undef) unless $n >= 2;
 
-    my @cand;
-    for my $i ($depth .. $n - 1 - $depth) {
-        my ($is_high, $is_low) = (1, 1);
-        for my $k (1 .. $depth) {
-            $is_high = 0 unless $c->[$i]{high} >  $c->[$i - $k]{high}
-                             && $c->[$i]{high} >= $c->[$i + $k]{high};
-            $is_low  = 0 unless $c->[$i]{low}  <  $c->[$i - $k]{low}
-                             && $c->[$i]{low}  <= $c->[$i + $k]{low};
-        }
-        push @cand, { idx => $i, price => $c->[$i]{high}, type => 'high' } if $is_high;
-        push @cand, { idx => $i, price => $c->[$i]{low},  type => 'low'  } if $is_low;
-    }
+    my @piv;
+    # Inicialización: la primera vela determina la dirección inicial.
+    # Usamos el close de la primera vela como extremo de referencia.
+    # dir=+1: buscando máximo (asumimos que venimos de un mínimo).
+    # dir=-1: buscando mínimo (asumimos que venimos de un máximo).
+    # Elegimos la dirección según si el close de la primera vela está
+    # más cerca del high o del low del rango de la primera vela.
+    my $first_range = $data->[0]{high} - $data->[0]{low};
+    my $init_dir = ($first_range > 0 &&
+                    ($data->[0]{close} - $data->[0]{low}) > $first_range * 0.5)
+                 ? 1 : -1;
 
-    @cand = sort { $a->{idx} <=> $b->{idx} } @cand;
+    my $dir       = $init_dir;
+    my $ext_price = ($dir > 0) ? $data->[0]{low} : $data->[0]{high};
+    my $ext_idx   = 0;
+    my $ext_type  = ($dir > 0) ? 'low' : 'high';
 
-    # Forzar alternancia estricta high/low
-    my @z;
-    for my $p (@cand) {
-        if (!@z) { push @z, $p; next; }
-        my $last = $z[-1];
-        if ($last->{type} eq $p->{type}) {
-            if ($p->{type} eq 'high') { $z[-1] = $p if $p->{price} > $last->{price}; }
-            else                      { $z[-1] = $p if $p->{price} < $last->{price}; }
+    for my $i (1 .. $n - 1) {
+        my $a   = $atr->[$i] // ($data->[$i]{high} - $data->[$i]{low} || 1);
+        my $thr = $factor * $a;
+        my $hi  = $data->[$i]{high};
+        my $lo  = $data->[$i]{low};
+
+        if ($dir > 0) {
+            # Buscando máximo
+            if ($hi >= $ext_price) {
+                $ext_price = $hi;
+                $ext_idx   = $i;
+                $ext_type  = 'high';
+            } elsif ($ext_price - $lo >= $thr) {
+                # Reversión bajista: confirmar el máximo como pivote
+                # Usar el high REAL de la vela del pivote (no $ext_price que puede
+                # diferir si la misma vela actualizó el extremo y causó reversión).
+                # Esto garantiza que el segmento siempre toca la mecha exacta de la vela.
+                my $piv_price = $data->[$ext_idx]{high};
+                push @piv, { index => $ext_idx, price => $piv_price, type => 'high' }
+                    unless @piv && $ext_idx == $piv[-1]{index};
+                $dir       = -1;
+                $ext_price = $lo;
+                $ext_idx   = $i;
+                $ext_type  = 'low';
+            }
         } else {
-            push @z, $p;
+            # Buscando mínimo
+            if ($lo <= $ext_price) {
+                $ext_price = $lo;
+                $ext_idx   = $i;
+                $ext_type  = 'low';
+            } elsif ($hi - $ext_price >= $thr) {
+                # Reversión alcista: confirmar el mínimo como pivote
+                my $piv_price_l = $data->[$ext_idx]{low};
+                push @piv, { index => $ext_idx, price => $piv_price_l, type => 'low' }
+                    unless @piv && $ext_idx == $piv[-1]{index};
+                $dir       = 1;
+                $ext_price = $hi;
+                $ext_idx   = $i;
+                $ext_type  = 'high';
+            }
         }
     }
-    return \@z;
+
+    return (\@piv, $ext_price, $ext_idx, $ext_type);
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _calc_atr_zz — ATR(14) de Wilder. Encapsulado aquí para no depender del
+# indicador ATR externo (independencia entre indicadores).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _calc_atr_zz {
+    my ($data, $p) = @_;
+    my (@atr, @tr);
+    for my $i (0 .. $#$data) {
+        my $c = $data->[$i];
+        my $tr = $i == 0 ? $c->{high} - $c->{low}
+               : do { my $pc = $data->[$i-1]{close};
+                      my $a  = $c->{high} - $c->{low};
+                      my $b  = abs($c->{high} - $pc);
+                      my $d  = abs($c->{low}  - $pc);
+                      $a > $b ? ($a > $d ? $a : $d) : ($b > $d ? $b : $d) };
+        push @tr, $tr;
+        if    ($i < $p - 1)  { push @atr, undef; }
+        elsif ($i == $p - 1) { my $s=0; $s+=$_ for @tr; push @atr, $s/$p; }
+        else                  { push @atr, (($atr[-1]*($p-1))+$tr)/$p; }
+    }
+    return @atr;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

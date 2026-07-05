@@ -72,7 +72,7 @@ sub draw {
     my $min   = $state->{price_min};
     my $max   = $state->{price_max};
     my $top   = $state->{top};
-    my $h     = $state->{price_h} - ($state->{vol_h} // 0);
+    my $h     = $state->{price_h};   # igual que PricePanel — incluye el área de volumen
 
     return unless defined $min && defined $max;
 
@@ -91,17 +91,17 @@ sub _draw_zzmtf {
     my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h) = @_;
 
     # Segmentos confirmados
+    # _seg_coords interpola los puntos cuando el from/to cae fuera de la ventana
+    # visible, para que la línea entre/salga por el borde con el precio correcto.
     my $segs = $ind->segments_in_range($start, $end);
     for my $s (@$segs) {
-        my $x1 = $x_of->($s->{from}{index} - $start);
-        my $y1 = $self->{scale}->price_to_y($s->{from}{price}, $min, $max, $top, $h);
-        my $x2 = $x_of->($s->{to}{index}   - $start);
-        my $y2 = $self->{scale}->price_to_y($s->{to}{price},   $min, $max, $top, $h);
-
+        my ($x1,$y1,$x2,$y2) = _seg_coords($s->{from}, $s->{to},
+                                            $x_of, $start, $end,
+                                            $self->{scale}, $min, $max, $top, $h);
+        next unless defined $x1;
         next if _both_outside($y1, $y2, $top, $h);
 
         my $color = ($s->{dir} eq 'up') ? $COLOR_UP : $COLOR_DOWN;
-
         $canvas->createLine($x1, $y1, $x2, $y2,
             -fill  => $color,
             -width => 2,
@@ -115,12 +115,10 @@ sub _draw_zzmtf {
         && $tent->{from}{index} <= $end
         && $tent->{to}{index}   >= $start) {
 
-        my $x1 = $x_of->($tent->{from}{index} - $start);
-        my $y1 = $self->{scale}->price_to_y($tent->{from}{price}, $min, $max, $top, $h);
-        my $x2 = $x_of->($tent->{to}{index}   - $start);
-        my $y2 = $self->{scale}->price_to_y($tent->{to}{price},   $min, $max, $top, $h);
-
-        unless (_both_outside($y1, $y2, $top, $h)) {
+        my ($x1,$y1,$x2,$y2) = _seg_coords($tent->{from}, $tent->{to},
+                                            $x_of, $start, $end,
+                                            $self->{scale}, $min, $max, $top, $h);
+        if (defined $x1 && !_both_outside($y1, $y2, $top, $h)) {
             my $color = ($tent->{dir} eq 'up') ? $COLOR_UP : $COLOR_DOWN;
             $canvas->createLine($x1, $y1, $x2, $y2,
                 -fill  => $color,
@@ -162,13 +160,11 @@ sub _draw_zzvolume {
     # Segmentos confirmados
     my $segs = $ind->segments_in_range($start, $end);
     for my $s (@$segs) {
-        my $x1 = $x_of->($s->{from}{index} - $start);
-        my $y1 = $self->{scale}->price_to_y($s->{from}{price}, $min, $max, $top, $h);
-        my $x2 = $x_of->($s->{to}{index}   - $start);
-        my $y2 = $self->{scale}->price_to_y($s->{to}{price},   $min, $max, $top, $h);
-
+        my ($x1,$y1,$x2,$y2) = _seg_coords($s->{from}, $s->{to},
+                                            $x_of, $start, $end,
+                                            $self->{scale}, $min, $max, $top, $h);
+        next unless defined $x1;
         next if _both_outside($y1, $y2, $top, $h);
-
         $canvas->createLine($x1, $y1, $x2, $y2,
             -fill  => $COLOR_EXT,
             -width => 2,
@@ -182,12 +178,10 @@ sub _draw_zzvolume {
         && $tent->{from}{index} <= $end
         && $tent->{to}{index}   >= $start) {
 
-        my $x1 = $x_of->($tent->{from}{index} - $start);
-        my $y1 = $self->{scale}->price_to_y($tent->{from}{price}, $min, $max, $top, $h);
-        my $x2 = $x_of->($tent->{to}{index}   - $start);
-        my $y2 = $self->{scale}->price_to_y($tent->{to}{price},   $min, $max, $top, $h);
-
-        unless (_both_outside($y1, $y2, $top, $h)) {
+        my ($x1,$y1,$x2,$y2) = _seg_coords($tent->{from}, $tent->{to},
+                                            $x_of, $start, $end,
+                                            $self->{scale}, $min, $max, $top, $h);
+        if (defined $x1 && !_both_outside($y1, $y2, $top, $h)) {
             $canvas->createLine($x1, $y1, $x2, $y2,
                 -fill  => $COLOR_EXT,
                 -width => 1,
@@ -196,6 +190,46 @@ sub _draw_zzvolume {
             );
         }
     }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _seg_coords — calcula (x1,y1,x2,y2) para un segmento, interpolando los
+# extremos que caen fuera de la ventana visible [start..end].
+#
+# Sin esto, cuando from.index < start o to.index > end, la línea entraría/
+# saldría del borde del canvas visualmente en el lugar equivocado (Tk la
+# recorta en el borde del widget, no en el precio correcto). La interpolación
+# lineal garantiza que la línea entre/salga exactamente en el precio correcto
+# al borde de la ventana, igual que TradingView.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _seg_coords {
+    my ($from, $to, $x_of, $start, $end, $scale, $min, $max, $top, $h) = @_;
+
+    my $fi = $from->{index};
+    my $ti = $to->{index};
+    my $fp = $from->{price};
+    my $tp = $to->{price};
+
+    # Interpolación lineal: si from o to caen fuera de [start,end],
+    # calcular el precio en el borde visible.
+    if ($fi < $start) {
+        # Interpolar el precio en start
+        my $ratio = ($start - $fi) / ($ti - $fi);
+        $fp = $fp + ($tp - $fp) * $ratio;
+        $fi = $start;
+    }
+    if ($ti > $end) {
+        my $ratio = ($ti - $end) / ($ti - $fi);
+        $tp = $tp - ($tp - $fp) * $ratio;
+        $ti = $end;
+    }
+    return () if $fi > $ti;
+
+    my $x1 = $x_of->($fi - $start);
+    my $y1 = $scale->price_to_y($fp, $min, $max, $top, $h);
+    my $x2 = $x_of->($ti - $start);
+    my $y2 = $scale->price_to_y($tp, $min, $max, $top, $h);
+    return ($x1, $y1, $x2, $y2);
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
