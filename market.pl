@@ -10,6 +10,8 @@ use Market::IndicatorManager;
 use Market::Indicators::ATR;
 use Market::Indicators::SMC_Structures;
 use Market::Indicators::Liquidity;
+use Market::Indicators::ZigZagMTF;
+use Market::Indicators::ZigZagVolume;
 use Market::ChartEngine;
 
 # ─── Resolución de archivos CSV ──────────────────────────────────────────────
@@ -66,6 +68,8 @@ $indicators->register('ATR', Market::Indicators::ATR->new(period => 14));
 $indicators->register('SMC_Structures', Market::Indicators::SMC_Structures->new(depth => 3));
 # PDF 4.1/4.2/4.3: k=3, tolerancia EQH/EQL=ATR*0.10, N=3 velas para Run, 3 velas para Grab
 $indicators->register('Liquidity', Market::Indicators::Liquidity->new(depth => 3));
+$indicators->register('ZigZagMTF',    Market::Indicators::ZigZagMTF->new());
+$indicators->register('ZigZagVolume', Market::Indicators::ZigZagVolume->new());
 $indicators->update_last($market);
 
 # ─── Interfaz gráfica ────────────────────────────────────────────────────────

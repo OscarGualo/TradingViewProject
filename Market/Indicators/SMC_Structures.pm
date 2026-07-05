@@ -114,6 +114,65 @@ sub new {
     return $self;
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _offset_indices — suma $base a todos los índices (locales -> globales) tras un
+# cálculo por ventana (Market::WindowProxy). NO toca daily_proximity->{daily_index}
+# porque ese es un índice del array 'D', no del 1m. Reconstruye los hashes *_by_index.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _offset_indices {
+    my ($self, $base) = @_;
+    return if !$base;
+
+    for my $sw (@{ $self->{swings} }) { $sw->{index} += $base; }
+    for my $ev (@{ $self->{events} }) {
+        $ev->{index}       += $base;
+        $ev->{level_index} += $base if defined $ev->{level_index};
+    }
+    for my $f (@{ $self->{fvgs} }) {
+        $f->{index}        += $base;
+        $f->{mitigated_at} += $base if defined $f->{mitigated_at};
+    }
+    for my $ob (@{ $self->{order_blocks} }) {
+        $ob->{index}        += $base;
+        $ob->{bos_index}    += $base if defined $ob->{bos_index};
+        $ob->{mitigated_at} += $base if defined $ob->{mitigated_at};
+    }
+    for my $lvl (@{ $self->{support_resistance} }) {
+        $lvl->{first_index} += $base;
+        $lvl->{last_index}  += $base;
+        $_ += $base for @{ $lvl->{touches} };
+    }
+    for my $tl (@{ $self->{trendlines} }) {
+        $tl->{point1}{index} += $base;
+        $tl->{point2}{index} += $base;
+        # slope/intercept se recalculan en índices globales:
+        my ($p1,$p2) = ($tl->{point1}, $tl->{point2});
+        my $dx = $p2->{index} - $p1->{index};
+        if ($dx != 0) {
+            $tl->{slope}     = ($p2->{price} - $p1->{price}) / $dx;
+            $tl->{intercept} = $p1->{price} - $tl->{slope} * $p1->{index};
+        }
+    }
+
+    # Reconstruir los índices O(1) por vela
+    $self->{swings_by_index} = {};
+    $self->{swings_by_index}{ $_->{index} } = $_ for @{ $self->{swings} };
+    $self->{events_by_index} = {};
+    for my $ev (@{ $self->{events} }) {
+        my $k = $ev->{index};
+        if (exists $self->{events_by_index}{$k}) {
+            my $e = $self->{events_by_index}{$k};
+            $self->{events_by_index}{$k} = ref($e) eq 'ARRAY' ? [@$e,$ev] : [$e,$ev];
+        } else { $self->{events_by_index}{$k} = $ev; }
+    }
+    $self->{fvgs_by_index} = {};
+    $self->{fvgs_by_index}{ $_->{index} } = $_ for @{ $self->{fvgs} };
+    $self->{order_blocks_by_index} = {};
+    $self->{order_blocks_by_index}{ $_->{index} } = $_ for @{ $self->{order_blocks} };
+}
+
+
 sub reset {
     my ($self) = @_;
     $self->{swings} = [];
@@ -309,6 +368,50 @@ sub calculate_all {
 
     # ── Paso 8: proximidad a la vela diaria más reciente ─────────────────────
     $self->_calc_daily_proximity($market_data, $data);
+
+    # Ordenar trendlines por point1.index para habilitar búsqueda binaria
+    @{ $self->{trendlines} } = sort { $a->{point1}{index} <=> $b->{point1}{index} }
+                                @{ $self->{trendlines} };
+
+    # Índice de buckets para FVG y OB (O(1) lookup en draw)
+    $self->_build_bucket_index();
+
+    # Windowing (Market::WindowProxy): convertir índices locales -> globales.
+    my $base = (ref($market_data) && $market_data->can('base_index'))
+             ? $market_data->base_index : 0;
+    $self->_offset_indices($base) if $base;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _build_bucket_index — asigna cada FVG y OB a todos los buckets que solapa.
+# Un FVG/OB vive desde {index} hasta {mitigated_at} (o ∞). Se añade al bucket
+# de su {index} y al de su fin, para que fvgs_in_range los encuentre aunque
+# el rango visible caiga en el medio de su "vida".
+# ─────────────────────────────────────────────────────────────────────────────
+sub _build_bucket_index {
+    my ($self) = @_;
+    my $B = 1000;
+    $self->{_bucket_size} = $B;
+
+    my (%fvg_idx, %ob_idx);
+    for my $fvg (@{ $self->{fvgs} }) {
+        my $b0 = int($fvg->{index} / $B);
+        my $b1 = defined $fvg->{mitigated_at}
+               ? int($fvg->{mitigated_at} / $B)
+               : $b0 + 200;   # activos: cubrimos 200k velas hacia adelante
+        $b1 = $b0 + 200 if $b1 - $b0 > 200;
+        push @{ $fvg_idx{$_} }, $fvg for $b0 .. $b1;
+    }
+    for my $ob (@{ $self->{order_blocks} }) {
+        my $b0 = int($ob->{index} / $B);
+        my $b1 = defined $ob->{mitigated_at}
+               ? int($ob->{mitigated_at} / $B)
+               : $b0 + 200;
+        $b1 = $b0 + 200 if $b1 - $b0 > 200;
+        push @{ $ob_idx{$_} }, $ob for $b0 .. $b1;
+    }
+    $self->{_fvg_bucket_idx} = \%fvg_idx;
+    $self->{_ob_bucket_idx}  = \%ob_idx;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -616,38 +719,37 @@ sub _detect_support_resistance {
         { type => 'high', kind => 'resistance' },
         { type => 'low',  kind => 'support' },
     ) {
-        my @pivots = grep { $_->{type} eq $kind_info->{type} } @{ $self->{swings} };
-        my @used;   # índices de @pivots ya asignados a un nivel
-
-        for (my $pi = 0; $pi <= $#pivots; $pi++) {
-            next if $used[$pi];
-
-            my $base_price  = $pivots[$pi]{price};
-            my $tolerance   = $base_price * $tolerance_pct;
-            my @touches     = ($pivots[$pi]{index});
-            my $sum_price   = $base_price;
-            my $count       = 1;
-
-            for (my $pj = $pi + 1; $pj <= $#pivots; $pj++) {
-                next if $used[$pj];
-                if (abs($pivots[$pj]{price} - $base_price) <= $tolerance) {
-                    push @touches, $pivots[$pj]{index};
-                    $sum_price += $pivots[$pj]{price};
-                    $count++;
-                    $used[$pj] = 1;
-                }
+        # OPTIMIZADO: en vez de O(n^2) comparando todos los pares, ordenamos
+        # los pivotes por precio y agrupamos clústeres contiguos dentro de
+        # tolerancia. O(n log n). Produce los mismos niveles de S/R.
+        my @pivots = sort { $a->{price} <=> $b->{price} }
+                     grep { $_->{type} eq $kind_info->{type} } @{ $self->{swings} };
+        my $i = 0;
+        while ($i <= $#pivots) {
+            my $base_price = $pivots[$i]{price};
+            my $tolerance  = $base_price * $tolerance_pct;
+            my @touches    = ($pivots[$i]{index});
+            my $sum_price  = $base_price;
+            my $count      = 1;
+            my $j = $i + 1;
+            while ($j <= $#pivots
+                   && abs($pivots[$j]{price} - $base_price) <= $tolerance) {
+                push @touches, $pivots[$j]{index};
+                $sum_price += $pivots[$j]{price};
+                $count++;
+                $j++;
             }
-
-            next if $count < 2;   # exigir al menos 2 toques para ser nivel
-
-            @touches = sort { $a <=> $b } @touches;
-            push @{ $self->{support_resistance} }, {
-                price       => $sum_price / $count,   # precio promedio del nivel
-                kind        => $kind_info->{kind},
-                touches     => \@touches,
-                first_index => $touches[0],
-                last_index  => $touches[-1],
-            };
+            if ($count >= 2) {
+                @touches = sort { $a <=> $b } @touches;
+                push @{ $self->{support_resistance} }, {
+                    price       => $sum_price / $count,
+                    kind        => $kind_info->{kind},
+                    touches     => \@touches,
+                    first_index => $touches[0],
+                    last_index  => $touches[-1],
+                };
+            }
+            $i = $j;
         }
     }
 
@@ -841,16 +943,55 @@ sub last_swing_low_before {
 
 # Devuelve todos los swings dentro de un rango de índices [start, end].
 # Usado por el Overlay para no iterar swings fuera de la ventana visible.
+# ─────────────────────────────────────────────────────────────────────────────
+# *_in_range OPTIMIZADOS — búsqueda binaria O(log n + k) en lugar de
+# grep O(n). Los arrays {swings}, {events}, {trendlines} están ordenados
+# por {index}; usamos _bsearch_lo/_bsearch_hi para acotar el slice.
+# ─────────────────────────────────────────────────────────────────────────────
+
+sub _bsearch_lo {
+    # primer índice en el array donde $arr->[$i]{index} >= $val
+    my ($arr, $val) = @_;
+    my ($lo, $hi) = (0, scalar @$arr);
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi) / 2);
+        $arr->[$mid]{index} < $val ? ($lo = $mid + 1) : ($hi = $mid);
+    }
+    return $lo;
+}
+
+sub _bsearch_hi {
+    # último índice en el array donde $arr->[$i]{index} <= $val  (retorna -1 si ninguno)
+    my ($arr, $val) = @_;
+    my ($lo, $hi) = (0, $#{$arr});
+    return -1 if !@$arr || $arr->[0]{index} > $val;
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi + 1) / 2);
+        $arr->[$mid]{index} > $val ? ($hi = $mid - 1) : ($lo = $mid);
+    }
+    return $lo;
+}
+
 sub swings_in_range {
     my ($self, $start, $end) = @_;
-    return [ grep { $_->{index} >= $start && $_->{index} <= $end } @{ $self->{swings} } ];
+    my $arr = $self->{swings};
+    return [] unless @$arr;
+    my $lo = _bsearch_lo($arr, $start);
+    my $hi = _bsearch_hi($arr, $end);
+    return [] if $hi < $lo;
+    return [ @{$arr}[$lo .. $hi] ];
 }
 
 # Equivalente a swings_in_range pero para eventos BOS/CHoCH.
 # Usado por el Overlay (3.5) para dibujar solo los eventos visibles.
 sub events_in_range {
     my ($self, $start, $end) = @_;
-    return [ grep { $_->{index} >= $start && $_->{index} <= $end } @{ $self->{events} } ];
+    my $arr = $self->{events};
+    return [] unless @$arr;
+    my $lo = _bsearch_lo($arr, $start);
+    my $hi = _bsearch_hi($arr, $end);
+    return [] if $hi < $lo;
+    return [ @{$arr}[$lo .. $hi] ];
 }
 
 # Devuelve solo los eventos de un tipo dado ('BOS' o 'CHoCH') dentro de un rango.
@@ -868,6 +1009,23 @@ sub events_in_range_by_type {
 # Overlay puede mostrar el rectángulo hasta el punto exacto de mitigación.
 sub fvgs_in_range {
     my ($self, $start, $end) = @_;
+    # Usar índice de buckets si está disponible (O(k) en vez de O(n))
+    if (my $idx = $self->{_fvg_bucket_idx}) {
+        my $B = $self->{_bucket_size};
+        my $b0 = int($start / $B);
+        my $b1 = int($end   / $B);
+        my %seen;
+        my @cand;
+        for my $b ($b0 .. $b1) {
+            for my $fvg (@{ $idx->{$b} // [] }) {
+                next if $seen{$fvg}++;
+                push @cand, $fvg
+                    if $fvg->{index} <= $end
+                    && (!defined $fvg->{mitigated_at} || $fvg->{mitigated_at} >= $start);
+            }
+        }
+        return \@cand;
+    }
     return [
         grep {
             $_->{index} <= $end
@@ -894,6 +1052,21 @@ sub active_fvgs_at {
 # la mitigación ocurrió dentro/después del rango visible.
 sub order_blocks_in_range {
     my ($self, $start, $end) = @_;
+    if (my $idx = $self->{_ob_bucket_idx}) {
+        my $B = $self->{_bucket_size};
+        my $b0 = int($start / $B);
+        my $b1 = int($end   / $B);
+        my %seen; my @cand;
+        for my $b ($b0 .. $b1) {
+            for my $ob (@{ $idx->{$b} // [] }) {
+                next if $seen{$ob}++;
+                push @cand, $ob
+                    if $ob->{index} <= $end
+                    && (!defined $ob->{mitigated_at} || $ob->{mitigated_at} >= $start);
+            }
+        }
+        return \@cand;
+    }
     return [
         grep {
             $_->{index} <= $end
@@ -917,10 +1090,17 @@ sub support_resistance_in_range {
 # rango visible [start,end].
 sub trendlines_in_range {
     my ($self, $start, $end) = @_;
-    return [
-        grep { $_->{point1}{index} <= $end && $_->{point2}{index} >= $start }
-        @{ $self->{trendlines} }
-    ];
+    my $arr = $self->{trendlines};
+    return [] unless @$arr;
+    # Trendlines ordenados por point1.index. Encontrar el último con p1 <= end.
+    my ($lo2, $hi2) = (0, $#{$arr});
+    return [] if $arr->[0]{point1}{index} > $end;
+    while ($lo2 < $hi2) {
+        my $mid = int(($lo2 + $hi2 + 1) / 2);
+        $arr->[$mid]{point1}{index} > $end ? ($hi2 = $mid - 1) : ($lo2 = $mid);
+    }
+    # De esos, filtrar por point2.index >= start (pocos elementos pasan este test)
+    return [ grep { $_->{point2}{index} >= $start } @{$arr}[0 .. $lo2] ];
 }
 
 1;

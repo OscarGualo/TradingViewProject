@@ -50,6 +50,7 @@ sub new {
         # PDF 4.1: "tolerancia = ATR * 0.10"
         atr_period    => $args{atr_period}    // 14,
         eq_tolerance_factor => $args{eq_tolerance_factor} // 0.10,
+        eq_lookback         => $args{eq_lookback} // 12,
 
         # N de velas de cierre consecutivo requeridas para clasificar un
         # evento como "Run" (PDF 4.2: "valor inicial N = 3")
@@ -92,6 +93,30 @@ sub new {
     return $self;
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _offset_indices — convierte índices locales -> globales tras cálculo por ventana.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _offset_indices {
+    my ($self, $base) = @_;
+    return if !$base;
+    for my $lv (@{ $self->{levels} }) {
+        $lv->{index}       += $base;
+        $lv->{pair_index}  += $base if defined $lv->{pair_index};
+        $lv->{swept_at}    += $base if defined $lv->{swept_at};
+        $lv->{resolved_at} += $base if defined $lv->{resolved_at};
+    }
+    $self->{levels_by_index} = {};
+    for my $lv (@{ $self->{levels} }) {
+        my $k = $lv->{index};
+        if (exists $self->{levels_by_index}{$k}) {
+            my $e = $self->{levels_by_index}{$k};
+            $self->{levels_by_index}{$k} = ref($e) eq 'ARRAY' ? [@$e,$lv] : [$e,$lv];
+        } else { $self->{levels_by_index}{$k} = $lv; }
+    }
+}
+
+
 sub reset {
     my ($self) = @_;
     $self->{levels} = [];
@@ -113,9 +138,35 @@ sub levels_at {
 }
 
 # Niveles dentro de un rango de índices — usado por el Overlay (3.5).
+sub _bsearch_lo {
+    my ($arr, $val) = @_;
+    my ($lo, $hi) = (0, scalar @$arr);
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi) / 2);
+        $arr->[$mid]{index} < $val ? ($lo = $mid + 1) : ($hi = $mid);
+    }
+    return $lo;
+}
+
+sub _bsearch_hi {
+    my ($arr, $val) = @_;
+    my ($lo, $hi) = (0, $#{$arr});
+    return -1 if !@$arr || $arr->[0]{index} > $val;
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi + 1) / 2);
+        $arr->[$mid]{index} > $val ? ($hi = $mid - 1) : ($lo = $mid);
+    }
+    return $lo;
+}
+
 sub levels_in_range {
     my ($self, $start, $end) = @_;
-    return [ grep { $_->{index} >= $start && $_->{index} <= $end } @{ $self->{levels} } ];
+    my $arr = $self->{levels};
+    return [] unless @$arr;
+    my $lo = _bsearch_lo($arr, $start);
+    my $hi = _bsearch_hi($arr, $end);
+    return [] if $hi < $lo;
+    return [ @{$arr}[$lo .. $hi] ];
 }
 
 # Solo niveles de un kind dado ('BSL'|'SSL'|'EQH'|'EQL') dentro de un rango.
@@ -188,6 +239,11 @@ sub calculate_replay {
     $self->_detect_levels_fast($data, $atr);
     $self->_run_state_machine($data);
     # Omitimos _calc_mtf_volume (no afecta el render del Replay)
+
+    # Windowing (Market::WindowProxy): índices locales -> globales.
+    my $base = (ref($market_data) && $market_data->can('base_index'))
+             ? $market_data->base_index : 0;
+    $self->_offset_indices($base) if $base;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,29 +359,40 @@ sub _detect_levels {
     # Se compara cada swing contra los anteriores (no solo el inmediato)
     # para detectar pares distantes en el tiempo, tal como especifica el
     # PDF ("Dos pivotes distantes en el tiempo se consideran iguales").
-    for (my $a = 0; $a <= $#highs; $a++) {
-        for (my $b = $a + 1; $b <= $#highs; $b++) {
-            my $tolerance = _tolerance_at($atr, $highs[$b]{index}, $factor);
-            next if !defined $tolerance;
-            if (abs($highs[$a]{price} - $highs[$b]{price}) <= $tolerance) {
-                $self->_push_level(
-                    $highs[$b]{index}, $highs[$b]{price}, 'EQH', $highs[$a]{index}
-                );
+    # OPTIMIZADO: cada high se empareja SOLO con el previo más cercano en
+    # precio dentro de una ventana acotada de swings (LOOKBACK). Antes esto
+    # era O(n^2) y generaba un nivel por CADA par -> explosión de niveles.
+    my $LOOKBACK = $self->{eq_lookback};
+    for (my $b = 1; $b <= $#highs; $b++) {
+        my $tolerance = _tolerance_at($atr, $highs[$b]{index}, $factor);
+        next if !defined $tolerance;
+        my $lo = $b - $LOOKBACK; $lo = 0 if $lo < 0;
+        my ($best_a, $best_diff);
+        for (my $a = $b - 1; $a >= $lo; $a--) {
+            my $diff = abs($highs[$a]{price} - $highs[$b]{price});
+            if ($diff <= $tolerance && (!defined $best_diff || $diff < $best_diff)) {
+                $best_diff = $diff; $best_a = $a;
             }
         }
+        $self->_push_level($highs[$b]{index}, $highs[$b]{price}, 'EQH', $highs[$best_a]{index})
+            if defined $best_a;
     }
 
     # ── EQL: pares de Swing Lows dentro de tolerancia ATR*0.10 ─────────────
-    for (my $a = 0; $a <= $#lows; $a++) {
-        for (my $b = $a + 1; $b <= $#lows; $b++) {
-            my $tolerance = _tolerance_at($atr, $lows[$b]{index}, $factor);
-            next if !defined $tolerance;
-            if (abs($lows[$a]{price} - $lows[$b]{price}) <= $tolerance) {
-                $self->_push_level(
-                    $lows[$b]{index}, $lows[$b]{price}, 'EQL', $lows[$a]{index}
-                );
+    my $LOOKBACK_L = $self->{eq_lookback};
+    for (my $b = 1; $b <= $#lows; $b++) {
+        my $tolerance = _tolerance_at($atr, $lows[$b]{index}, $factor);
+        next if !defined $tolerance;
+        my $lo = $b - $LOOKBACK_L; $lo = 0 if $lo < 0;
+        my ($best_a, $best_diff);
+        for (my $a = $b - 1; $a >= $lo; $a--) {
+            my $diff = abs($lows[$a]{price} - $lows[$b]{price});
+            if ($diff <= $tolerance && (!defined $best_diff || $diff < $best_diff)) {
+                $best_diff = $diff; $best_a = $a;
             }
         }
+        $self->_push_level($lows[$b]{index}, $lows[$b]{price}, 'EQL', $lows[$best_a]{index})
+            if defined $best_a;
     }
 
     # Reordenar cronológicamente: los pasos anteriores insertan BSL/SSL

@@ -69,6 +69,9 @@ sub new {
             choch  => 0,
             fvg    => 0,
             fib    => 0,
+            ob     => 0,   # Order Blocks
+            sr     => 0,   # Support / Resistance
+            trend  => 0,   # Trendlines / Channels
         },
     };
     bless $self, $class;
@@ -117,6 +120,15 @@ sub draw {
 
     $self->_draw_fibonacci($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
         if $self->{visible}{fib};
+
+    $self->_draw_order_blocks($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{ob};
+
+    $self->_draw_support_resistance($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{sr};
+
+    $self->_draw_trendlines($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{trend};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,6 +321,125 @@ sub _draw_fibonacci {
             -fill   => '#9c8a5c',
             -font   => ['Arial', 7],
             -tags   => 'smc_fib',
+        );
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_order_blocks — "OB: Inside Order Blocks" (cronograma 29/06)
+#
+# Dibuja cada Order Block como un rectángulo semitransparente que va desde la
+# vela donde se formó (index) hasta la vela donde se mitigó (mitigated_at), o
+# hasta el borde visible si sigue activo. Verde = bullish, rojo = bearish.
+# La etiqueta "OB" se coloca dentro del bloque, arriba a la izquierda.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_order_blocks {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    for my $ob (@{ $smc->order_blocks_in_range($start, $end) }) {
+        my $i1 = $ob->{index};
+        my $i2 = defined $ob->{mitigated_at} ? $ob->{mitigated_at} : $end;
+        $i1 = $start if $i1 < $start;
+        $i2 = $end   if $i2 > $end;
+
+        my $x1 = $x_of->($i1 - $start);
+        my $x2 = $x_of->($i2 - $start);
+        my $y_top = $self->{scale}->price_to_y($ob->{top},    $min, $max, $top, $h);
+        my $y_bot = $self->{scale}->price_to_y($ob->{bottom}, $min, $max, $top, $h);
+
+        # Recorte vertical: si el bloque queda totalmente fuera del panel, saltar.
+        next if $y_bot < $top || $y_top > $top + $h;
+
+        my $color = ($ob->{direction} eq 'bullish') ? '#26a69a' : '#ef5350';
+
+        $canvas->createRectangle($x1, $y_top, $x2, $y_bot,
+            -fill    => $color,
+            -stipple => 'gray12',        # semitransparencia (Tk no tiene alpha real)
+            -outline => $color,
+            -width   => 1,
+            -tags    => 'smc_ob',
+        );
+        $canvas->createText($x1 + 3, $y_top + 7,
+            -anchor => 'w',
+            -text   => 'OB',
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'smc_ob',
+        );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_support_resistance — "Support/Resistence: below support or above
+# resistance levels" (cronograma 29/06)
+#
+# Cada nivel se dibuja como una línea horizontal punteada extendida desde su
+# primer toque hasta el borde derecho visible. Resistencia = rojo con etiqueta
+# "R"; Soporte = verde con etiqueta "S".
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_support_resistance {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    my $right = $state->{right} // $x_of->($end - $start);
+
+    for my $lvl (@{ $smc->support_resistance_in_range($start, $end) }) {
+        my $y = $self->{scale}->price_to_y($lvl->{price}, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        my $is_res = ($lvl->{kind} eq 'resistance');
+        my $color  = $is_res ? '#ef5350' : '#26a69a';
+
+        my $fi = $lvl->{first_index} < $start ? $start : $lvl->{first_index};
+        my $x1 = $x_of->($fi - $start);
+
+        $canvas->createLine($x1, $y, $right, $y,
+            -fill  => $color,
+            -dash  => [2, 2],
+            -width => 1,
+            -tags  => 'smc_sr',
+        );
+        $canvas->createText($x1 + 4, $y - 6,
+            -anchor => 'w',
+            -text   => $is_res ? 'R' : 'S',
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'smc_sr',
+        );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_trendlines — "Trendlines/Channels: below or above" (cronograma 29/06)
+#
+# Cada trendline conecta dos swings consecutivos del mismo tipo. Se dibuja el
+# segmento y se EXTIENDE hacia adelante usando slope/intercept hasta el borde
+# visible. Resistencia (highs) = rojo; Soporte (lows) = verde.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_trendlines {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    for my $tl (@{ $smc->trendlines_in_range($start, $end) }) {
+        my $i1 = $tl->{point1}{index};
+        my $i2 = $end;                       # extender el canal hacia adelante
+        $i1 = $start if $i1 < $start;
+
+        my $p1 = $tl->{slope} * $i1 + $tl->{intercept};
+        my $p2 = $tl->{slope} * $i2 + $tl->{intercept};
+
+        my $x1 = $x_of->($i1 - $start);
+        my $x2 = $x_of->($i2 - $start);
+        my $y1 = $self->{scale}->price_to_y($p1, $min, $max, $top, $h);
+        my $y2 = $self->{scale}->price_to_y($p2, $min, $max, $top, $h);
+
+        next if ($y1 < $top && $y2 < $top) || ($y1 > $top + $h && $y2 > $top + $h);
+
+        my $color = ($tl->{kind} eq 'resistance') ? '#ef5350' : '#26a69a';
+
+        $canvas->createLine($x1, $y1, $x2, $y2,
+            -fill  => $color,
+            -width => 1,
+            -tags  => 'smc_trend',
         );
     }
 }

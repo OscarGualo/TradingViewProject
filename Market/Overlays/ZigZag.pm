@@ -1,0 +1,210 @@
+package Market::Overlays::ZigZag;
+use strict;
+use warnings;
+use lib '.';
+use Market::Panels::Scales;
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Market::Overlays::ZigZag
+#
+# Responsabilidad EXCLUSIVA: dibujar en el canvas lo que calcularon
+# Market::Indicators::ZigZagMTF y Market::Indicators::ZigZagVolume.
+# No calcula nada — separación estricta Indicators vs Overlays (Tabla 1).
+#
+# Dibuja:
+#   ZZMTF (dirección interna):
+#     - Segmentos confirmados : línea sólida verde (up) / roja (down), grosor 2
+#     - Segmento tentativo    : mismos colores, línea punteada [4,2], grosor 1
+#     - Etiquetas HH/HL/LH/LL : sobre cada pivote, arriba si high / abajo si low
+#
+#   ZigZag Volume (dirección externa):
+#     - Segmentos confirmados : línea sólida azul (#2962ff), grosor 2
+#     - Segmento tentativo    : azul punteado [4,2], grosor 1
+#     (sin etiquetas — solo los segmentos, como en el PDF pág.5)
+#
+# Compatible con Replay: ChartEngine llama a draw() con $start/$end ya
+# recortados al cursor, y los indicadores devuelven solo elementos en ese
+# rango, igual que SMC_Structures y Liquidity.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Colores (PDF pág. 4 / pág. 5)
+my $COLOR_UP    = '#26a69a';   # verde  — ZZMTF alcista
+my $COLOR_DOWN  = '#ef5350';   # rojo   — ZZMTF bajista
+my $COLOR_EXT   = '#2962ff';   # azul   — ZZVolume (dirección externa)
+my $COLOR_LABEL = '#2962ff';   # azul   — etiquetas HH/HL/LH/LL (PDF: text color)
+
+sub new {
+    my ($class, %args) = @_;
+    my $self = {
+        scale   => Market::Panels::Scales->new(),
+        visible => {
+            zzmtf    => 0,   # dirección interna  (verde/rojo)
+            zzvolume => 0,   # dirección externa  (azul)
+        },
+    };
+    bless $self, $class;
+    return $self;
+}
+
+sub set_visible {
+    my ($self, $key, $value) = @_;
+    $self->{visible}{$key} = $value ? 1 : 0;
+}
+
+sub is_visible {
+    my ($self, $key) = @_;
+    return $self->{visible}{$key} // 0;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# draw — punto de entrada, llamado desde ChartEngine::draw()
+#
+# $zzmtf   : objeto Market::Indicators::ZigZagMTF   (puede ser undef)
+# $zzv     : objeto Market::Indicators::ZigZagVolume (puede ser undef)
+# $x_of    : closure  índice_local -> coordenada_X
+# $state   : hashref de contexto (igual que usa PricePanel/ATRPanel)
+# ─────────────────────────────────────────────────────────────────────────────
+sub draw {
+    my ($self, $canvas, $zzmtf, $zzv, $x_of, $state) = @_;
+
+    my $start = $state->{start_index};
+    my $end   = $state->{end_index};
+    my $min   = $state->{price_min};
+    my $max   = $state->{price_max};
+    my $top   = $state->{top};
+    my $h     = $state->{price_h} - ($state->{vol_h} // 0);
+
+    return unless defined $min && defined $max;
+
+    # ZZVolume debajo (capa de fondo) para que ZZMTF quede encima
+    $self->_draw_zzvolume($canvas, $zzv,   $x_of, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{zzvolume} && defined $zzv;
+
+    $self->_draw_zzmtf($canvas,   $zzmtf, $x_of, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{zzmtf}   && defined $zzmtf;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_zzmtf — segmentos y etiquetas de la dirección INTERNA
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_zzmtf {
+    my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h) = @_;
+
+    # Segmentos confirmados
+    my $segs = $ind->segments_in_range($start, $end);
+    for my $s (@$segs) {
+        my $x1 = $x_of->($s->{from}{index} - $start);
+        my $y1 = $self->{scale}->price_to_y($s->{from}{price}, $min, $max, $top, $h);
+        my $x2 = $x_of->($s->{to}{index}   - $start);
+        my $y2 = $self->{scale}->price_to_y($s->{to}{price},   $min, $max, $top, $h);
+
+        next if _both_outside($y1, $y2, $top, $h);
+
+        my $color = ($s->{dir} eq 'up') ? $COLOR_UP : $COLOR_DOWN;
+
+        $canvas->createLine($x1, $y1, $x2, $y2,
+            -fill  => $color,
+            -width => 2,
+            -tags  => 'zz_mtf',
+        );
+    }
+
+    # Segmento tentativo (punteado, grosor 1 — aún no confirmado)
+    my $tent = $ind->tentative_segment();
+    if (defined $tent
+        && $tent->{from}{index} <= $end
+        && $tent->{to}{index}   >= $start) {
+
+        my $x1 = $x_of->($tent->{from}{index} - $start);
+        my $y1 = $self->{scale}->price_to_y($tent->{from}{price}, $min, $max, $top, $h);
+        my $x2 = $x_of->($tent->{to}{index}   - $start);
+        my $y2 = $self->{scale}->price_to_y($tent->{to}{price},   $min, $max, $top, $h);
+
+        unless (_both_outside($y1, $y2, $top, $h)) {
+            my $color = ($tent->{dir} eq 'up') ? $COLOR_UP : $COLOR_DOWN;
+            $canvas->createLine($x1, $y1, $x2, $y2,
+                -fill  => $color,
+                -width => 1,
+                -dash  => [4, 2],
+                -tags  => 'zz_mtf',
+            );
+        }
+    }
+
+    # Etiquetas HH/HL/LH/LL sobre pivotes confirmados visibles
+    my $pivots = $ind->pivots_in_range($start, $end);
+    for my $p (@$pivots) {
+        next unless $p->{confirmed};
+
+        my $x = $x_of->($p->{index} - $start);
+        my $y = $self->{scale}->price_to_y($p->{price}, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        my $label_y = ($p->{type} eq 'high') ? ($y - 14) : ($y + 14);
+
+        $canvas->createText($x, $label_y,
+            -text   => $p->{label},
+            -anchor => 'center',
+            -fill   => $COLOR_LABEL,
+            -font   => ['Arial', 8, 'bold'],
+            -tags   => 'zz_mtf',
+        );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_zzvolume — segmentos de la dirección EXTERNA (azul)
+# Solo líneas, sin etiquetas (PDF pág. 5)
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_zzvolume {
+    my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h) = @_;
+
+    # Segmentos confirmados
+    my $segs = $ind->segments_in_range($start, $end);
+    for my $s (@$segs) {
+        my $x1 = $x_of->($s->{from}{index} - $start);
+        my $y1 = $self->{scale}->price_to_y($s->{from}{price}, $min, $max, $top, $h);
+        my $x2 = $x_of->($s->{to}{index}   - $start);
+        my $y2 = $self->{scale}->price_to_y($s->{to}{price},   $min, $max, $top, $h);
+
+        next if _both_outside($y1, $y2, $top, $h);
+
+        $canvas->createLine($x1, $y1, $x2, $y2,
+            -fill  => $COLOR_EXT,
+            -width => 2,
+            -tags  => 'zz_vol',
+        );
+    }
+
+    # Segmento tentativo (punteado)
+    my $tent = $ind->tentative_segment();
+    if (defined $tent
+        && $tent->{from}{index} <= $end
+        && $tent->{to}{index}   >= $start) {
+
+        my $x1 = $x_of->($tent->{from}{index} - $start);
+        my $y1 = $self->{scale}->price_to_y($tent->{from}{price}, $min, $max, $top, $h);
+        my $x2 = $x_of->($tent->{to}{index}   - $start);
+        my $y2 = $self->{scale}->price_to_y($tent->{to}{price},   $min, $max, $top, $h);
+
+        unless (_both_outside($y1, $y2, $top, $h)) {
+            $canvas->createLine($x1, $y1, $x2, $y2,
+                -fill  => $COLOR_EXT,
+                -width => 1,
+                -dash  => [4, 2],
+                -tags  => 'zz_vol',
+            );
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _both_outside — true si los dos extremos están fuera del panel visible.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _both_outside {
+    my ($y1, $y2, $top, $h) = @_;
+    my $bot = $top + $h;
+    return (($y1 < $top && $y2 < $top) || ($y1 > $bot && $y2 > $bot));
+}
+
+1;

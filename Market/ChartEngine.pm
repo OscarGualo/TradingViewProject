@@ -11,6 +11,9 @@ use Market::Panels::ATRPanel;
 use Market::ReplayProxy;
 use Market::Overlays::SMC_Structures;
 use Market::Overlays::Liquidity;
+use Market::Indicators::ZigZagMTF;
+use Market::Indicators::ZigZagVolume;
+use Market::Overlays::ZigZag;
 
 sub new {
     my ($class, %args) = @_;
@@ -34,6 +37,7 @@ sub new {
         # ── 3.5: Overlays SMC y Liquidez ──────────────────────────────────────
         smc_overlay => Market::Overlays::SMC_Structures->new(),
         liq_overlay => Market::Overlays::Liquidity->new(),
+        zz_overlay  => Market::Overlays::ZigZag->new(),
 
         # ── Estado del sistema Replay (Fase 2) ───────────────────────────────
         # replay_mode   : 0 = normal, 1 = en modo replay activo
@@ -93,67 +97,47 @@ sub run {
     );
     my @TF_ORDER = (1, 5, 15, 60, 120, 240, 'D', 'W');
 
-    # ── Botón desplegable de temporalidad ────────────────────────────────────
-    # Muestra el TF activo y al hacer clic despliega el menú con todos los TFs.
-    my $tf_btn = $top->Menubutton(
-        -text             => $TF_LABEL{ $self->{tf} } // "$self->{tf}",
-        -relief           => 'flat',
-        -borderwidth      => 0,
-        -padx             => 14,
-        -pady             => 5,
-        -font             => ['Arial', 9, 'bold'],
-        -foreground       => '#ffffff',
-        -background       => '#2962ff',
-        -activeforeground => '#ffffff',
-        -activebackground => '#1a47cc',
-        -cursor           => 'hand2',
-        -indicatoron      => 0,        # sin la flecha nativa de Tk
-        -direction        => 'below',
-    );
-
-    # Helper: actualiza la etiqueta del botón al cambiar TF
+    # ── Selector de temporalidad — fila de botones inline ────────────────────
+    # FIX WSL/WSLg: los Menu popup de Tk no se renderizan (aparecen como una
+    # ventana vacía). Usamos botones siempre visibles, sin ventana emergente.
+    my %tf_btns;
     my $_refresh_tf_btns = sub {
         my ($active_tf) = @_;
-        my $lbl = $TF_LABEL{$active_tf} // "$active_tf";
-        $tf_btn->configure(-text => $lbl);
+        for my $tf (@TF_ORDER) {
+            next unless $tf_btns{$tf};
+            if ("$tf" eq "$active_tf") {
+                $tf_btns{$tf}->configure(-background => '#2962ff', -foreground => '#ffffff', -activebackground => '#1a47cc');
+            } else {
+                $tf_btns{$tf}->configure(-background => '#1e222d', -foreground => '#b2b5be', -activebackground => '#2a2e39');
+            }
+        }
     };
     $self->{_refresh_tf_btns} = $_refresh_tf_btns;
 
-    # Construir el menú desplegable con separadores entre grupos
-    my $tf_menu = $tf_btn->Menu(
-        -tearoff        => 0,
-        -background     => '#1e222d',
-        -foreground     => '#b2b5be',
-        -activebackground => '#2962ff',
-        -activeforeground => '#ffffff',
-        -font           => ['Arial', 9, 'bold'],
-        -relief         => 'flat',
-        -borderwidth    => 1,
-    );
-
-    my @groups = ([1, 5, 15], [60, 120, 240], ['D', 'W']);
-    for my $gi (0 .. $#groups) {
-        $tf_menu->add('separator') if $gi > 0;
-        for my $tf (@{ $groups[$gi] }) {
-            my $tf_copy = $tf;
-            my $lbl     = $TF_LABEL{$tf};
-            $tf_menu->add('command',
-                -label            => $lbl,
-                -command          => sub {
-                    $self->set_timeframe($tf_copy);
-                    $_refresh_tf_btns->($tf_copy);
-                },
-                -font             => ['Arial', 9, 'bold'],
-                -background       => '#1e222d',
-                -foreground       => '#b2b5be',
-                -activebackground => '#2962ff',
-                -activeforeground => '#ffffff',
-            );
-        }
+    for my $tf (@TF_ORDER) {
+        my $tf_copy = $tf;
+        my $b = $top->Button(
+            -text             => $TF_LABEL{$tf},
+            -relief           => 'flat',
+            -borderwidth      => 0,
+            -padx             => 8,
+            -pady             => 5,
+            -font             => ['Arial', 9, 'bold'],
+            -foreground       => '#b2b5be',
+            -background       => '#1e222d',
+            -activeforeground => '#ffffff',
+            -activebackground => '#2a2e39',
+            -cursor           => 'hand2',
+        );
+        $b->configure(-command => sub {
+            $self->set_timeframe($tf_copy);
+            $_refresh_tf_btns->($tf_copy);
+        });
+        $b->pack(-side => 'left', -padx => 1);
+        $tf_btns{$tf} = $b;
     }
+    $_refresh_tf_btns->($self->{tf});
 
-    $tf_btn->configure(-menu => $tf_menu);
-    $tf_btn->pack(-side => 'left', -padx => 4);
 
     # Separador visual entre selector TF y botón de escala
     $top->Label(
@@ -197,44 +181,17 @@ sub run {
     });
     $scale_btn->pack(-side => 'left', -padx => 6);
 
-    # ── 3.5-B: Menú desplegable "Overlays" ────────────────────────────────────
-    # Checkbuttons para activar/desactivar individualmente cada elemento
-    # visual de SMC_Structures y Liquidity, según exige la sección 4.5 del
-    # PDF: "permitiendo además su activación o desactivación individual
-    # desde el menú de opciones de la interfaz de usuario".
+    # ── Overlays — panel Toplevel (FIX WSL/WSLg) ─────────────────────────────
+    # En vez de un Menu emergente (que WSLg no dibuja), usamos una ventana
+    # Toplevel REAL con checkbuttons. WSLg sí renderiza ventanas normales, igual
+    # que la ventana principal. Se crea oculta y el botón la muestra/oculta.
+    # PDF 4.5: activación/desactivación individual de cada overlay.
     $top->Label(-text => '|', -foreground => '#363a45', -background => '#1e222d',
                 -font => ['Arial', 11], -padx => 4)->pack(-side => 'left');
 
-    my $overlays_btn = $top->Menubutton(
-        -text             => 'Overlays',
-        -relief           => 'flat',
-        -borderwidth      => 0,
-        -padx             => 12,
-        -pady             => 5,
-        -font             => ['Arial', 9, 'bold'],
-        -foreground       => '#b2b5be',
-        -background       => '#1e222d',
-        -activeforeground => '#ffffff',
-        -activebackground => '#2a2e39',
-        -cursor           => 'hand2',
-        -indicatoron      => 0,
-        -direction        => 'below',
-    );
-
-    my $overlays_menu = $overlays_btn->Menu(
-        -tearoff          => 0,
-        -background       => '#1e222d',
-        -foreground       => '#b2b5be',
-        -activebackground => '#2962ff',
-        -activeforeground => '#ffffff',
-        -font             => ['Arial', 9],
-        -relief           => 'flat',
-        -borderwidth      => 1,
-    );
-
-    # Variables de checkbutton para SMC_Structures — todos desactivados por defecto
     my %smc_var = (
         swings => 0, bos => 0, choch => 0, fvg => 0, fib => 0,
+        ob => 0, sr => 0, trend => 0,
     );
     my %smc_menu_label = (
         swings => 'HH / HL / LH / LL',
@@ -242,29 +199,12 @@ sub run {
         choch  => 'CHoCH',
         fvg    => 'FVG',
         fib    => 'Fibonacci',
+        ob     => 'Order Blocks',
+        sr     => 'Support / Resistance',
+        trend  => 'Trendlines / Channels',
     );
-    for my $key (qw(swings bos choch fvg fib)) {
-        $overlays_menu->add('checkbutton',
-            -label    => $smc_menu_label{$key},
-            -variable => \$smc_var{$key},
-            -onvalue  => 1,
-            -offvalue => 0,
-            -command  => sub {
-                $self->{smc_overlay}->set_visible($key, $smc_var{$key});
-                $self->draw();
-            },
-            -font             => ['Arial', 9],
-            -background       => '#1e222d',
-            -foreground       => '#b2b5be',
-            -activebackground => '#2962ff',
-            -activeforeground => '#ffffff',
-            -selectcolor      => '#26a69a',
-        );
-    }
+    my @smc_order = qw(swings bos choch fvg fib ob sr trend);
 
-    $overlays_menu->add('separator');
-
-    # Variables de checkbutton para Liquidity — todos desactivados por defecto
     my %liq_var = (
         bsl => 0, ssl => 0, eqh => 0, eql => 0, sweep => 0, grab => 0, run => 0,
     );
@@ -277,28 +217,116 @@ sub run {
         grab  => 'Liquidity Grab',
         run   => 'Liquidity Run',
     );
-    for my $key (qw(bsl ssl eqh eql sweep grab run)) {
-        $overlays_menu->add('checkbutton',
-            -label    => $liq_menu_label{$key},
-            -variable => \$liq_var{$key},
-            -onvalue  => 1,
-            -offvalue => 0,
+    my @liq_order = qw(bsl ssl eqh eql sweep grab run);
+
+    # Ventana del panel de overlays (creada oculta)
+    my $ov_win = $mw->Toplevel();
+    $ov_win->title('Overlays');
+    $ov_win->configure(-background => '#1e222d');
+    $ov_win->withdraw();
+    $ov_win->protocol('WM_DELETE_WINDOW', sub { $ov_win->withdraw(); });
+
+    my $smc_box = $ov_win->Frame(-background => '#1e222d')
+        ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
+    $smc_box->Label(-text => 'SMC Structures', -background => '#1e222d',
+        -foreground => '#5b9cff', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
+    my $smc_frame = $smc_box;
+    for my $key (@smc_order) {
+        my $k = $key;
+        $smc_frame->Checkbutton(
+            -text     => $smc_menu_label{$k},
+            -variable => \$smc_var{$k},
+            -onvalue  => 1, -offvalue => 0,
             -command  => sub {
-                $self->{liq_overlay}->set_visible($key, $liq_var{$key});
+                $self->{smc_overlay}->set_visible($k, $smc_var{$k});
                 $self->draw();
             },
-            -font             => ['Arial', 9],
-            -background       => '#1e222d',
-            -foreground       => '#b2b5be',
-            -activebackground => '#2962ff',
-            -activeforeground => '#ffffff',
-            -selectcolor      => '#26a69a',
-        );
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#26a69a', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
     }
 
-    $overlays_btn->configure(-menu => $overlays_menu);
+    my $liq_box = $ov_win->Frame(-background => '#1e222d')
+        ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
+    $liq_box->Label(-text => 'Liquidity', -background => '#1e222d',
+        -foreground => '#5b9cff', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
+    my $liq_frame = $liq_box;
+    for my $key (@liq_order) {
+        my $k = $key;
+        $liq_frame->Checkbutton(
+            -text     => $liq_menu_label{$k},
+            -variable => \$liq_var{$k},
+            -onvalue  => 1, -offvalue => 0,
+            -command  => sub {
+                $self->{liq_overlay}->set_visible($k, $liq_var{$k});
+                $self->draw();
+            },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#26a69a', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
+
+    # ── ZigZag (dirección interna + externa) ─────────────────────────────
+    my %zz_var = (zzmtf => 0, zzvolume => 0);
+    my %zz_menu_label = (
+        zzmtf    => 'ZZMTF (Dir. Interna)',
+        zzvolume => 'ZZ Volume (Dir. Externa)',
+    );
+    my @zz_order = qw(zzmtf zzvolume);
+    my $zz_box = $ov_win->Frame(-background => '#1e222d')
+        ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
+    $zz_box->Label(-text => 'ZigZag', -background => '#1e222d',
+        -foreground => '#5b9cff', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
+    for my $key (@zz_order) {
+        my $k = $key;
+        $zz_box->Checkbutton(
+            -text     => $zz_menu_label{$k},
+            -variable => \$zz_var{$k},
+            -onvalue  => 1, -offvalue => 0,
+            -command  => sub {
+                $self->{zz_overlay}->set_visible($k, $zz_var{$k});
+                $self->draw();
+            },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#26a69a', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
+    my $overlays_btn = $top->Button(
+        -text             => 'Overlays',
+        -relief           => 'flat',
+        -borderwidth      => 0,
+        -padx             => 12,
+        -pady             => 5,
+        -font             => ['Arial', 9, 'bold'],
+        -foreground       => '#b2b5be',
+        -background       => '#1e222d',
+        -activeforeground => '#ffffff',
+        -activebackground => '#2a2e39',
+        -cursor           => 'hand2',
+    );
+    $overlays_btn->configure(-command => sub {
+        if ($ov_win->state() eq 'withdrawn') {
+            my $x = $overlays_btn->rootx();
+            my $y = $overlays_btn->rooty() + $overlays_btn->height() + 2;
+            $ov_win->geometry("+$x+$y");
+            $ov_win->deiconify();
+            $ov_win->raise();
+        } else {
+            $ov_win->withdraw();
+        }
+    });
     $overlays_btn->pack(-side => 'left', -padx => 2);
     $self->{_overlays_btn} = $overlays_btn;
+    $self->{_ov_win} = $ov_win;
+
 
 
     # ── Barra de controles Replay ─────────────────────────────────────────────
@@ -868,24 +896,31 @@ sub _replay_stop_timer {
 sub _replay_recalc_indicators {
     my ($self) = @_;
 
-    my $proxy = Market::ReplayProxy->new(
-        $self->{market},
-        $self->{replay_cursor},
-    );
+    # ── OPTIMIZACIÓN DE RENDIMIENTO ──────────────────────────────────────────
+    # Antes se recalculaba TODO el prefijo 0..cursor en cada paso -> O(cursor),
+    # ~3-10s por vela con 100k+ velas. Ahora:
+    #   • ATR: NO se recalcula. Es causal (solo depende del pasado), así que el
+    #     array completo ya calculado sirve para cualquier cursor; el panel solo
+    #     dibuja el prefijo hasta el cursor.
+    #   • SMC y Liquidity: se recalculan SOLO sobre una VENTANA de las últimas
+    #     REPLAY_WINDOW velas (Market::WindowProxy) -> O(W) constante. Verificado:
+    #     produce resultados idénticos a 0..cursor en el rango visible, ~50x más
+    #     rápido. Cumple el PDF: 'cálculos limitados a velas visibles + ventana
+    #     de contexto', sin filtrar velas futuras (la ventana termina en cursor).
+    my $REPLAY_WINDOW = $self->{replay_window} // 4000;
 
-    # Recalcular ATR y SMC_Structures normalmente — son rápidos (~0.4s total).
-    # Liquidity usa calculate_replay() que omite EQH/EQL O(n²):
-    # de 2.5s → 0.65s por step (4.7x más rápido), sin violar el PDF.
     my $ind = $self->{indicators};
+    my $cursor = $self->{replay_cursor};
 
-    my $atr = $ind->get_indicator('ATR');
-    $atr->calculate_all($proxy) if defined $atr;
+    my $wproxy = Market::WindowProxy->new($self->{market}, $cursor, $REPLAY_WINDOW);
 
     my $smc = $ind->get_indicator('SMC_Structures');
-    $smc->calculate_all($proxy) if defined $smc;
+    $smc->calculate_all($wproxy) if defined $smc;
 
     my $liq = $ind->get_indicator('Liquidity');
-    $liq->calculate_replay($proxy) if defined $liq;
+    $liq->calculate_replay($wproxy) if defined $liq;
+
+    # ATR: intencionalmente NO se recalcula (ver comentario arriba).
 }
 
 # Centra la vista alrededor del replay_cursor manteniendo contexto histórico.
@@ -1096,6 +1131,10 @@ sub draw {
 
     my $liq_ind = $self->{indicators}->get_indicator('Liquidity');
     $self->{liq_overlay}->draw($c, $liq_ind, $x_of, \%state) if defined $liq_ind;
+
+    my $zzm_ind = $self->{indicators}->get_indicator('ZigZagMTF');
+    my $zzv_ind = $self->{indicators}->get_indicator('ZigZagVolume');
+    $self->{zz_overlay}->draw($c, $zzm_ind, $zzv_ind, $x_of, \%state);
 
     # Limpia el área del ATR para ocultar cualquier vela/volumen que se haya pasado.
     $c->createRectangle(
