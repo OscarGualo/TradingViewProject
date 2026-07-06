@@ -54,6 +54,7 @@ sub new {
         replay_timer         => undef,
         replay_saved_first   => undef,
         replay_saved_visible => undef,
+        replay_free_view     => 0,     # 1 = usuario hizo zoom/scroll libre en replay
         # replay_picking: 1 cuando el usuario está eligiendo el punto de corte
         # (modo intermedio entre "normal" y "replay activo")
         replay_picking       => 0,
@@ -696,6 +697,7 @@ sub replay_enter_at {
     # Activar modo replay en el índice elegido
     $self->{replay_mode}   = 1;
     $self->{replay_cursor} = $index;
+    $self->{replay_free_view} = 0;   # resetear al comenzar replay desde nuevo punto
 
     # Restaurar cursor normal
     $self->{canvas}->configure(-cursor => 'crosshair') if $self->{canvas};
@@ -757,6 +759,7 @@ sub replay_exit {
         $self->{first}   = $self->{replay_saved_first};
         $self->{visible} = $self->{replay_saved_visible};
         $self->{replay_saved_first}   = undef;
+    $self->{replay_free_view}     = 0;   # resetear al salir del replay
         $self->{replay_saved_visible} = undef;
     }
     $self->limit_first();
@@ -924,10 +927,7 @@ sub _replay_recalc_indicators {
 
     # ZigZagMTF y ZigZagVolume: SÍ se recalculan en cada paso de replay.
     # El tramo tentativo debe actualizarse con cada nueva vela para que
-    # el zigzag siga el precio en tiempo real (como TradingView en replay):
-    # la línea punteada crece vela a vela hasta que hay suficiente reversión
-    # para confirmar el nuevo pivote. Sin este recálculo el tentativo queda
-    # fijo al precio de cuando se entró al replay.
+    # el zigzag siga el precio en tiempo real (como TradingView en replay).
     my $zzm = $ind->get_indicator('ZigZagMTF');
     $zzm->calculate_all($wproxy) if defined $zzm;
 
@@ -939,16 +939,32 @@ sub _replay_recalc_indicators {
 # Muestra las últimas ~120 velas con el cursor en el 80% derecho de la pantalla.
 sub _replay_center_view {
     my ($self) = @_;
-    my $cursor  = $self->{replay_cursor};
-    my $visible = $self->{visible};
-    $visible = 120 if $visible > 300;   # zoom razonable en replay
+    my $cursor = $self->{replay_cursor};
 
-    # Posicionar para que el cursor quede al 80% de la pantalla
+    # ── Modo LIBRE: usuario hizo zoom/scroll durante el replay. ─────────────
+    # No forzar vista. Solo recentrar si el cursor sale del área visible,
+    # igual que TradingView en modo replay.
+    if ($self->{replay_free_view}) {
+        my $start = int($self->{first});
+        my $end   = $start + $self->{visible} - 1;
+        if ($cursor < $start || $cursor > $end) {
+            # Cursor salió de pantalla: recentrar sin cambiar zoom ni escala
+            $self->{first} = $cursor - int($self->{visible} * 0.80);
+            $self->limit_first();
+            if ($self->{auto_y}) {
+                delete $self->{price_min}; delete $self->{price_max};
+                delete $self->{atr_min};   delete $self->{atr_max};
+            }
+        }
+        return;
+    }
+
+    # ── Modo NORMAL: centrar la vista en el cursor. ──────────────────────────
+    my $visible = $self->{visible};
+    $visible = 120 if $visible > 300;
     $self->{visible} = $visible;
     $self->{first}   = $cursor - int($visible * 0.80);
     $self->limit_first();
-
-    # Limpiar precio/ATR para auto-escala en la nueva ventana
     delete $self->{price_min}; delete $self->{price_max};
     delete $self->{atr_min};   delete $self->{atr_max};
 }
@@ -1799,6 +1815,7 @@ sub mouse_drag {
         # Movimiento horizontal: tiempo/eje X
         $self->{first} = $self->{drag}{first} - $dx / $plot_w * $self->{visible};
         $self->limit_first();
+        $self->{replay_free_view} = 1 if $self->{replay_mode};
 
             if ($self->{auto_y}) {
         # Auto vertical activo:
@@ -1937,6 +1954,9 @@ sub mouse_wheel {
     } else {
         $self->{lock_y_on_zoom} = 1;
     }
+
+    # En replay: zoom del usuario → activar vista libre
+    $self->{replay_free_view} = 1 if $self->{replay_mode};
 
     $self->request_draw();
 }
