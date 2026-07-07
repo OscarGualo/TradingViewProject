@@ -129,25 +129,6 @@ sub _draw_zzmtf {
         }
     }
 
-    # Etiquetas HH/HL/LH/LL sobre pivotes confirmados visibles
-    my $pivots = $ind->pivots_in_range($start, $end);
-    for my $p (@$pivots) {
-        next unless $p->{confirmed};
-
-        my $x = $x_of->($p->{index} - $start);
-        my $y = $self->{scale}->price_to_y($p->{price}, $min, $max, $top, $h);
-        next if $y < $top || $y > $top + $h;
-
-        my $label_y = ($p->{type} eq 'high') ? ($y - 14) : ($y + 14);
-
-        $canvas->createText($x, $label_y,
-            -text   => $p->{label},
-            -anchor => 'center',
-            -fill   => $COLOR_LABEL,
-            -font   => ['Arial', 8, 'bold'],
-            -tags   => 'zz_mtf',
-        );
-    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

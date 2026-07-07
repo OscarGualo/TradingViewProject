@@ -105,7 +105,7 @@ sub draw {
     my $min   = $state->{price_min};
     my $max   = $state->{price_max};
     my $top   = $state->{top};
-    my $h     = $state->{price_h} - ($state->{vol_h} // 0);
+    my $h     = $state->{price_h};   # FIX: igual que PricePanel — incluye zona de volumen
 
     return unless defined $min && defined $max;
 
@@ -139,22 +139,37 @@ sub draw {
 sub _draw_swings {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
+    # Estilo LuxAlgo SMC (imágenes 3, 4, 5 de referencia):
+    #   - Pequeña línea vertical desde la punta de la mecha (5px)
+    #   - Etiqueta del label (HH/HL/LH/LL) justo encima/debajo de esa línea
+    #   - Colores: verde para HH/HL (alcista), rojo/cyan para LH/LL (bajista)
+    #   - Solo sobre la mecha: high para swing highs, low para swing lows
     my $swings = $smc->swings_in_range($start, $end);
     for my $sw (@$swings) {
-        my $local_i = $sw->{index} - $start;
-        my $x = $x_of->($local_i);
+        my $x = $x_of->($sw->{index} - $start);
         my $y = $self->{scale}->price_to_y($sw->{price}, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
 
         my $color = $SWING_COLOR{ $sw->{label} } // '#787b86';
-        # Los swing highs se etiquetan ARRIBA del precio, los lows ABAJO,
-        # para no tapar la mecha de la vela.
-        my $label_y = ($sw->{type} eq 'high') ? ($y - 12) : ($y + 12);
+        my $is_high = ($sw->{type} eq 'high');
 
+        # Pequeña línea vertical: desde la punta de la mecha hacia afuera (5px)
+        my $line_y1 = $is_high ? ($y - 5) : ($y + 5);
+        my $line_y2 = $is_high ? ($y - 1) : ($y + 1);
+        $canvas->createLine($x, $line_y1, $x, $line_y2,
+            -fill  => $color,
+            -width => 1,
+            -tags  => 'smc_swing',
+        );
+
+        # Etiqueta: 8px más allá de la línea (encima para highs, debajo para lows)
+        my $label_y = $is_high ? ($y - 14) : ($y + 14);
         $canvas->createText($x, $label_y,
-            -text => $sw->{label},
-            -fill => $color,
-            -font => ['Arial', 8, 'bold'],
-            -tags => 'smc_swing',
+            -text   => $sw->{label},
+            -anchor => 'center',
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'smc_swing',
         );
     }
 }
@@ -167,173 +182,94 @@ sub _draw_swings {
 sub _draw_events {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
+    # Colores: alcista=verde, bajista=rojo. CHoCH más saturado.
+    my %BOS_COLOR   = (up => '#26a69a', down => '#ef5350');
+    my %CHOCH_COLOR = (up => '#26a69a', down => '#ef5350');
+    my $right = $state->{right} // $x_of->($end - $start);
+
+    # ── Agrupar eventos por vela para detectar CHoCH+BOS simultáneos ────────
+    # Cuando CHoCH y BOS ocurren en la misma vela con el mismo nivel y
+    # dirección, se muestran con la etiqueta "CHoCH BOS" en la misma línea
+    # (comportamiento de TradingView / LuxAlgo, imagen 6 de referencia).
+    my %by_candle;
     my $events = $smc->events_in_range($start, $end);
     for my $ev (@$events) {
-        next if $ev->{type} eq 'BOS'   && !$self->{visible}{bos};
-        next if $ev->{type} eq 'CHoCH' && !$self->{visible}{choch};
-
-        # Línea horizontal corta entre el nivel roto y la vela de confirmación
-        my $level_local = $ev->{level_index} - $start;
-        my $event_local = $ev->{index} - $start;
-        my $x1 = $x_of->($level_local);
-        my $x2 = $x_of->($event_local);
-        my $y  = $self->{scale}->price_to_y($ev->{level_price}, $min, $max, $top, $h);
-
-        my $color = $EVENT_COLOR{ $ev->{direction} } // '#787b86';
-        my $dash  = ($ev->{scope} eq 'external') ? [4, 2] : undef;
-
-        my @line_args = (
-            -fill => $color,
-            -width => 1,
-            -tags  => 'smc_event',
-        );
-        push @line_args, (-dash => $dash) if defined $dash;
-
-        $canvas->createLine($x1, $y, $x2, $y, @line_args);
-
-        # Etiqueta de texto: "BOS" / "CHoCH", con sufijo si es external
-        my $label = $ev->{type};
-        $label .= ' (ext)' if $ev->{scope} eq 'external';
-
-        my $label_y = ($ev->{direction} eq 'up') ? ($y - 10) : ($y + 10);
-        $canvas->createText($x2, $label_y,
-            -text => $label,
-            -fill => $color,
-            -font => ['Arial', 8, ($ev->{type} eq 'CHoCH' ? 'bold italic' : 'bold')],
-            -tags => 'smc_event',
-        );
+        push @{ $by_candle{ $ev->{index} } }, $ev;
     }
-}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _draw_fvgs — rectángulos de Fair Value Gap con desvanecimiento progresivo.
-#
-# La opacidad NO existe como concepto nativo en Tk::Canvas (no hay alpha
-# real), así que el desvanecimiento se simula con la técnica estándar de
-# Tk: el parámetro -stipple con distintas densidades de patrón. A mayor
-# antigüedad del FVG, mayor "vacío" en el patrón (stipple más disperso),
-# dando la sensación visual de transparencia creciente.
-# ─────────────────────────────────────────────────────────────────────────────
-sub _draw_fvgs {
-    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+    for my $idx (sort { $a <=> $b } keys %by_candle) {
+        my @evs = @{ $by_candle{$idx} };
 
-    my $fvgs = $smc->fvgs_in_range($start, $end);
-    my $current_index = $end;   # vela más reciente visible = referencia de "ahora"
+        # Filtrar por visibilidad
+        @evs = grep {
+            ($_->{type} eq 'BOS'   && $self->{visible}{bos})   ||
+            ($_->{type} eq 'CHoCH' && $self->{visible}{choch})
+        } @evs;
+        next unless @evs;
 
-    for my $f (@$fvgs) {
-        my $x1_local = $f->{index} - $start;
-        my $x1 = $x_of->($x1_local);
+        # Agrupar por nivel+dirección para fusionar CHoCH+BOS del mismo nivel
+        my %groups;
+        for my $ev (@evs) {
+            my $key = sprintf("%.2f_%s", $ev->{level_price}, $ev->{direction});
+            push @{ $groups{$key} }, $ev;
+        }
 
-        # El rectángulo se extiende desde la formación hasta la mitigación
-        # (o hasta el borde visible si sigue activo).
-        my $end_index = defined $f->{mitigated_at} ? $f->{mitigated_at} : $end;
-        $end_index = $end if $end_index > $end;
-        my $x2_local = $end_index - $start;
-        my $x2 = $x_of->($x2_local);
+        for my $key (keys %groups) {
+            my @grp = @{ $groups{$key} };
+            my $ev  = $grp[0];   # tomar el primero como referencia
 
-        next if $x2 < $x1;   # fuera de rango visible
+            # Determinar si hay CHoCH en este grupo
+            my $has_choch = grep { $_->{type} eq 'CHoCH' } @grp;
+            my $has_bos   = grep { $_->{type} eq 'BOS'   } @grp;
 
-        my $y1 = $self->{scale}->price_to_y($f->{top},    $min, $max, $top, $h);
-        my $y2 = $self->{scale}->price_to_y($f->{bottom}, $min, $max, $top, $h);
+            my $color = ($ev->{direction} eq 'up')
+                      ? $BOS_COLOR{up} : $BOS_COLOR{down};
 
-        my $color = $FVG_COLOR{ $f->{direction} } // '#787b86';
+            # Etiqueta: "CHoCH", "BOS", o "CHoCH BOS" si coexisten
+            my $label = $has_choch && $has_bos ? 'CHoCH  BOS'
+                      : $has_choch             ? 'CHoCH'
+                      :                          'BOS';
 
-        # Desvanecimiento: cuántas velas han pasado desde la formación,
-        # relativo a la vela "actual" del gráfico (current_index).
-        my $age = $current_index - $f->{index};
-        $age = 0 if $age < 0;
-        my $stipple = _stipple_for_age($age, $FVG_FADE_WINDOW, $f->{mitigated_at});
+            # ── Línea horizontal ─────────────────────────────────────────────
+            # Estilo: sólido para externo (estructura mayor), dashed para interno
+            my $is_ext = ($ev->{scope} eq 'external');
+            my $y = $self->{scale}->price_to_y($ev->{level_price}, $min, $max, $top, $h);
+            next if $y < $top || $y > $top + $h;
 
-        my %rect_args = (
-            -fill    => $color,
-            -outline => '',
-            -tags    => 'smc_fvg',
-        );
-        $rect_args{-stipple} = $stipple if defined $stipple;
+            # X inicio: el swing roto (level_index)
+            my $x1 = ($ev->{level_index} >= $start)
+                   ? $x_of->($ev->{level_index} - $start)
+                   : $x_of->(0);
 
-        $canvas->createRectangle($x1, $y1, $x2, $y2, %rect_args);
-    }
-}
+            # X fin: la vela que confirma la ruptura
+            my $x2 = ($ev->{index} <= $end)
+                   ? $x_of->($ev->{index} - $start)
+                   : $right;
 
-# Selecciona el patrón -stipple según la edad del FVG, simulando
-# desvanecimiento progresivo. FVG mitigados siempre usan el patrón más
-# disperso (casi invisible) independientemente de la edad, porque ya
-# dejaron de ser una "zona de alta reacción" relevante.
-sub _stipple_for_age {
-    my ($age, $fade_window, $mitigated_at) = @_;
+            my @line_args = (
+                -fill  => $color,
+                -width => $is_ext ? 2 : 1,
+                -tags  => 'smc_event',
+            );
+            push @line_args, (-dash => [4, 3]) unless $is_ext;
 
-    return 'gray12' if defined $mitigated_at;   # mitigado: casi invisible
+            $canvas->createLine($x1, $y, $x2, $y, @line_args);
 
-    my $ratio = $age / $fade_window;
-    return 'gray75' if $ratio < 0.15;   # recién formado: más sólido
-    return 'gray50' if $ratio < 0.40;
-    return 'gray25' if $ratio < 0.75;
-    return 'gray12';                    # viejo: casi invisible
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _draw_fibonacci — niveles de Fibonacci Retracement entre el último
-# Swing High y el último Swing Low relevantes dentro del rango visible.
-#
-# PDF 4: el documento exige "niveles de Fibonacci" como parte del cálculo
-# de SMC_Structures.pm. Se trazan los 7 niveles estándar entre el pivote
-# más reciente (Swing High o Low, el que sea más reciente cronológicamente)
-# y su contraparte inmediatamente anterior.
-# ─────────────────────────────────────────────────────────────────────────────
-my @FIB_LEVELS = (0, 0.236, 0.382, 0.5, 0.618, 0.786, 1);
-
-sub _draw_fibonacci {
-    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
-
-    # Encontrar el swing más reciente <= end (el "ancla" del retroceso)
-    my $last_high = $smc->last_swing_high_before($end);
-    my $last_low  = $smc->last_swing_low_before($end);
-    return unless defined $last_high && defined $last_low;
-
-    # El pivote más reciente cronológicamente es el punto de inicio del
-    # retroceso; el otro es el punto final.
-    my ($from, $to) = ($last_high->{index} > $last_low->{index})
-        ? ($last_low, $last_high)   # low antes, high es el más reciente -> retroceso bajista
-        : ($last_high, $last_low);  # high antes, low es el más reciente -> retroceso alcista
-
-    my $price_from = $from->{price};
-    my $price_to   = $to->{price};
-    my $range      = $price_to - $price_from;
-    return if $range == 0;
-
-    my $x_left  = $x_of->(0);
-    my $x_right = $state->{right} // $x_of->($end - $start);
-
-    for my $level (@FIB_LEVELS) {
-        my $price = $price_to - ($range * $level);
-        my $y = $self->{scale}->price_to_y($price, $min, $max, $top, $h);
-        next if $y < $top || $y > $top + $h;
-
-        $canvas->createLine($x_left, $y, $x_right, $y,
-            -fill  => '#9c8a5c',
-            -width => 1,
-            -dash  => [2, 4],
-            -tags  => 'smc_fib',
-        );
-        $canvas->createText($x_right - 4, $y - 8,
-            -anchor => 'e',
-            -text   => sprintf('%.1f%% (%.2f)', $level * 100, $price),
-            -fill   => '#9c8a5c',
-            -font   => ['Arial', 7],
-            -tags   => 'smc_fib',
-        );
+            # ── Etiqueta al centro del segmento ──────────────────────────────
+            my $label_x = ($x1 + $x2) / 2;
+            my $label_y = ($ev->{direction} eq 'up') ? ($y - 9) : ($y + 9);
+            $canvas->createText($label_x, $label_y,
+                -text   => $label,
+                -fill   => $color,
+                -anchor => 'center',
+                -font   => ['Arial', 7, ($has_choch ? 'bold italic' : 'bold')],
+                -tags   => 'smc_event',
+            );
+        }
     }
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _draw_order_blocks — "OB: Inside Order Blocks" (cronograma 29/06)
-#
-# Dibuja cada Order Block como un rectángulo semitransparente que va desde la
-# vela donde se formó (index) hasta la vela donde se mitigó (mitigated_at), o
-# hasta el borde visible si sigue activo. Verde = bullish, rojo = bearish.
-# La etiqueta "OB" se coloca dentro del bloque, arriba a la izquierda.
-# ─────────────────────────────────────────────────────────────────────────────
 sub _draw_order_blocks {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 

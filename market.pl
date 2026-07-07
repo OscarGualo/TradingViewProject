@@ -65,7 +65,7 @@ $market->print_summary();
 my $indicators = Market::IndicatorManager->new();
 $indicators->register('ATR', Market::Indicators::ATR->new(period => 14));
 # PDF 4.1: "valor inicial recomendado k = 3" para la profundidad de Swing Points
-$indicators->register('SMC_Structures', Market::Indicators::SMC_Structures->new(depth => 3));
+$indicators->register('SMC_Structures', Market::Indicators::SMC_Structures->new(depth => 5));
 # PDF 4.1/4.2/4.3: k=3, tolerancia EQH/EQL=ATR*0.10, N=3 velas para Run, 3 velas para Grab
 $indicators->register('Liquidity', Market::Indicators::Liquidity->new(depth => 3));
 $indicators->register('ZigZagMTF',    Market::Indicators::ZigZagMTF->new());

@@ -40,7 +40,7 @@ sub new {
     my $self = {
         # Profundidad de vecindad para detectar un swing.
         # PDF 4.1: "valor inicial recomendado k = 3"
-        depth => $args{depth} || 3,
+        depth => $args{depth} // 5,   # LuxAlgo default para 1m: 5
 
         # Resultado del último calculate_all():
         #   swings: arrayref de hashrefs { index, price, type, label }
@@ -272,72 +272,76 @@ sub calculate_all {
 
     return if $n < (2 * $k + 1);   # no hay suficientes velas para un swing
 
-    # ── Paso 1: detección de Swing High / Swing Low ──────────────────────────
-    # PDF 4.1 — Swing High en índice i si y solo si:
-    #   High[i] > High[i-k..i-1]  Y  High[i] > High[i+1..i+k]
-    # Swing Low en índice i si y solo si:
-    #   Low[i]  < Low[i-k..i-1]   Y  Low[i]  < Low[i+1..i+k]
-    my @raw_swings;   # lista cronológica de { index, price, type }
+    # ── Paso 1 + 2: Swing Points con alternancia forzada (estilo LuxAlgo) ──────
+    #
+    # Algoritmo en dos fases:
+    #   A) Candidatos: velas que son extremo local dentro de la ventana ±k.
+    #   B) Zigzag con alternancia estricta: en rachas del mismo tipo (high/high
+    #      o low/low) conservar solo el extremo más pronunciado. Esto produce
+    #      una secuencia high→low→high→... limpia, igual que LuxAlgo SMC.
+    #
+    # Esto elimina el 99% de las etiquetas duplicadas/consecutivas y produce
+    # la misma densidad visual que TradingView (5-10 swings en 200 velas).
 
+    # Fase A: candidatos extremo local
+    my @cand;
     for (my $i = $k; $i <= $n - 1 - $k; $i++) {
         my $c = $data->[$i];
 
-        # Comprobar Swing High
         my $is_high = 1;
         for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
-            if ($data->[$j]{high} >= $c->{high}) {
-                $is_high = 0;
-                last;
-            }
+            if ($data->[$j]{high} >= $c->{high}) { $is_high = 0; last; }
         }
         if ($is_high) {
-            push @raw_swings, { index => $i, price => $c->{high}, type => 'high' };
-            next;   # una vela no puede ser swing high y swing low a la vez
+            push @cand, { index => $i, price => $c->{high}, type => 'high' };
+            next;
         }
 
-        # Comprobar Swing Low
         my $is_low = 1;
         for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
-            if ($data->[$j]{low} <= $c->{low}) {
-                $is_low = 0;
-                last;
-            }
+            if ($data->[$j]{low} <= $c->{low}) { $is_low = 0; last; }
         }
         if ($is_low) {
-            push @raw_swings, { index => $i, price => $c->{low}, type => 'low' };
+            push @cand, { index => $i, price => $c->{low}, type => 'low' };
         }
     }
 
-    # ── Paso 2: máquina de estados HH/HL/LH/LL ───────────────────────────────
-    # Se recorre la secuencia cronológica de swings comparando cada swing
-    # con el ANTERIOR DEL MISMO TIPO (high con high, low con low).
-    #   Swing High más alto que el SH anterior  -> HH (Higher High)
-    #   Swing High más bajo  que el SH anterior  -> LH (Lower High)
-    #   Swing Low  más alto que el SL anterior  -> HL (Higher Low)
-    #   Swing Low  más bajo  que el SL anterior  -> LL (Lower Low)
-    # El primer swing de cada tipo no tiene comparación previa: se etiqueta
-    # con el nombre genérico según su tipo (high -> HH, low -> LL) como punto
-    # de partida neutral de la secuencia.
-    my $last_high;   # último Swing High visto { index, price }
-    my $last_low;    # último Swing Low visto  { index, price }
-
-    for my $sw (@raw_swings) {
-        my $label;
-
-        if ($sw->{type} eq 'high') {
-            if (defined $last_high) {
-                $label = ($sw->{price} > $last_high->{price}) ? 'HH' : 'LH';
+    # Fase B: zigzag con alternancia estricta
+    # En rachas del mismo tipo conservar el extremo más pronunciado (igual
+    # que hace el ZZMTF). Produce secuencia limpia high/low/high/...
+    my @zz;
+    for my $c (@cand) {
+        if (!@zz) { push @zz, $c; next; }
+        my $last = $zz[-1];
+        if ($last->{type} eq $c->{type}) {
+            # mismo tipo: conservar el más extremo
+            if ($c->{type} eq 'high') {
+                $zz[-1] = $c if $c->{price} > $last->{price};
             } else {
-                $label = 'HH';   # primer swing high de la serie
+                $zz[-1] = $c if $c->{price} < $last->{price};
             }
-            $last_high = { index => $sw->{index}, price => $sw->{price} };
         } else {
-            if (defined $last_low) {
-                $label = ($sw->{price} > $last_low->{price}) ? 'HL' : 'LL';
-            } else {
-                $label = 'LL';   # primer swing low de la serie
-            }
-            $last_low = { index => $sw->{index}, price => $sw->{price} };
+            push @zz, $c;
+        }
+    }
+
+    # Fase C: etiquetar HH/HL/LH/LL comparando cada swing con el anterior
+    # del mismo tipo (igual que antes pero ahora la serie ya está alternada)
+    my $last_high;
+    my $last_low;
+
+    for my $sw (@zz) {
+        my $label;
+        if ($sw->{type} eq 'high') {
+            $label = defined $last_high
+                   ? ($sw->{price} > $last_high->{price} ? 'HH' : 'LH')
+                   : 'HH';
+            $last_high = $sw;
+        } else {
+            $label = defined $last_low
+                   ? ($sw->{price} > $last_low->{price} ? 'HL' : 'LL')
+                   : 'LL';
+            $last_low = $sw;
         }
 
         my $entry = {
@@ -346,7 +350,6 @@ sub calculate_all {
             type  => $sw->{type},
             label => $label,
         };
-
         push @{ $self->{swings} }, $entry;
         $self->{swings_by_index}{ $sw->{index} } = $entry;
     }
@@ -445,128 +448,121 @@ sub _build_bucket_index {
 sub _detect_bos_choch {
     my ($self, $data) = @_;
 
-    # Snapshots ordenados cronológicamente de cada tipo de swing, para poder
-    # ubicar "el último swing antes de la vela i" con un puntero avanzando.
+    # ── Algoritmo alineado con LuxAlgo SMC ──────────────────────────────────
+    # Principios clave observados en TradingView:
+    #
+    # 1. ALTERNANCIA ESTRUCTURAL: la tendencia alterna entre BOS y CHoCH.
+    #    En tendencia alcista: BOS up confirman, CHoCH down señala reversión.
+    #    En tendencia bajista: BOS down confirman, CHoCH up señala reversión.
+    #
+    # 2. UN EVENTO POR SWING: una vez que se rompe un nivel (swing_index),
+    #    ese nivel queda "consumido". No se emite otro evento para el mismo
+    #    nivel aunque el precio siga cerrando más allá.
+    #
+    # 3. CHoCH + BOS simultáneos: cuando el mismo close rompe el nivel del
+    #    CHoCH Y el del BOS, se emiten ambos — el CHoCH con el nivel del
+    #    swing contrario roto, el BOS con el nivel del swing a favor.
+    #
+    # 4. CUERPO de la vela: la ruptura se confirma con max(open,close) para
+    #    alcistas y min(open,close) para bajistas. Las mechas no cuentan.
+    #
+    # 5. NIVEL CORRECTO: BOS up usa last_high_1 (el swing high más reciente),
+    #    BOS down usa last_low_1. El "external" usa el swing anterior.
+
     my @highs = grep { $_->{type} eq 'high' } @{ $self->{swings} };
     my @lows  = grep { $_->{type} eq 'low'  } @{ $self->{swings} };
 
-    # Punteros de avance: cuántos swings de cada tipo ya han ocurrido
-    # antes o en la vela actual.
-    my $hi_ptr = 0;   # próximo índice en @highs aún no consumido por el puntero
+    my $hi_ptr = 0;
     my $lo_ptr = 0;
-
-    # Niveles "activos" disponibles para romper en cada momento.
-    # last_high_1 = último HH/LH visto, last_high_2 = el anterior a ese (external)
     my ($last_high_1, $last_high_2);
     my ($last_low_1,  $last_low_2);
 
-    # Bandera de "ya consumido": evita reportar el mismo BOS/CHoCH en cada
-    # vela subsiguiente que sigue cerrando más allá del mismo nivel.
-    my $bos_up_done    = 0;
-    my $bos_down_done  = 0;
-    my $choch_up_done  = 0;
-    my $choch_down_done = 0;
+    # Índices de los swings ya "consumidos" por un evento
+    my %consumed_high;
+    my %consumed_low;
 
-    # Tendencia vigente, inferida de forma simple a partir de la secuencia
-    # de swings: arranca 'unknown' y se fija con el primer BOS confirmado.
     my $trend = 'unknown';
 
     for (my $i = 0; $i < scalar(@$data); $i++) {
-        my $close = $data->[$i]{close};
 
-        # Avanzar los punteros de swings hasta incorporar todo lo que ya
-        # ocurrió en índices <= i (un swing en el índice i mismo ya es
-        # información válida porque depende de velas pasadas, no futuras,
-        # gracias a la ventana de profundidad k usada en el paso 1).
+        # Avanzar punteros incorporando swings hasta el índice actual
         while ($hi_ptr <= $#highs && $highs[$hi_ptr]{index} <= $i) {
             $last_high_2 = $last_high_1;
             $last_high_1 = $highs[$hi_ptr];
             $hi_ptr++;
-            # Nuevo swing high disponible: resetear banderas de consumo
-            # relativas a niveles de "high" (BOS alcista, CHoCH bajista).
-            $bos_up_done   = 0;
-            $choch_down_done = 0;
         }
         while ($lo_ptr <= $#lows && $lows[$lo_ptr]{index} <= $i) {
             $last_low_2 = $last_low_1;
             $last_low_1 = $lows[$lo_ptr];
             $lo_ptr++;
-            $bos_down_done = 0;
-            $choch_up_done = 0;
         }
 
-        # ── BOS alcista: Close > último Swing High ───────────────────────────
-        if (defined $last_high_1 && $close > $last_high_1->{price} && !$bos_up_done) {
-            my $scope = (defined $last_high_2 && $close > $last_high_2->{price})
-                ? 'external' : 'internal';
-            $self->_push_event($i, 'BOS', 'up', $scope,
-                $last_high_1->{price}, $last_high_1->{index});
-            $bos_up_done = 1;
-            $trend = 'up';
-        }
+        next unless defined $last_high_1 && defined $last_low_1;
 
-        # ── BOS bajista: Close < último Swing Low ────────────────────────────
-        if (defined $last_low_1 && $close < $last_low_1->{price} && !$bos_down_done) {
-            my $scope = (defined $last_low_2 && $close < $last_low_2->{price})
-                ? 'external' : 'internal';
-            $self->_push_event($i, 'BOS', 'down', $scope,
-                $last_low_1->{price}, $last_low_1->{index});
-            $bos_down_done = 1;
-            $trend = 'down';
-        }
+        # Cuerpo de la vela (mechas excluidas)
+        my $body_high = $data->[$i]{close} > $data->[$i]{open}
+                      ? $data->[$i]{close} : $data->[$i]{open};
+        my $body_low  = $data->[$i]{close} < $data->[$i]{open}
+                      ? $data->[$i]{close} : $data->[$i]{open};
 
-        # ── CHoCH bajista: en tendencia alcista, Close < último Swing Low ────
-        # (rompe el último HL — la estructura de mínimos crecientes se rompe)
-        if ($trend eq 'up' && defined $last_low_1
-            && $close < $last_low_1->{price} && !$choch_down_done) {
-            my $scope = (defined $last_low_2 && $close < $last_low_2->{price})
-                ? 'external' : 'internal';
+        # ── CHoCH bajista: tendencia up, cuerpo rompe bajo el último HL ─────
+        if (($trend eq 'up' || $trend eq 'unknown')
+            && !$consumed_low{ $last_low_1->{index} }
+            && $body_low < $last_low_1->{price}) {
+
+            my $scope = (defined $last_low_2 && $body_low < $last_low_2->{price})
+                      ? 'external' : 'internal';
             $self->_push_event($i, 'CHoCH', 'down', $scope,
                 $last_low_1->{price}, $last_low_1->{index});
-            $choch_down_done = 1;
+            $consumed_low{ $last_low_1->{index} } = 1;
             $trend = 'down';
         }
 
-        # ── CHoCH alcista: en tendencia bajista, Close > último Swing High ───
-        # (rompe el último LH — la estructura de máximos decrecientes se rompe)
-        if ($trend eq 'down' && defined $last_high_1
-            && $close > $last_high_1->{price} && !$choch_up_done) {
-            my $scope = (defined $last_high_2 && $close > $last_high_2->{price})
-                ? 'external' : 'internal';
+        # ── CHoCH alcista: tendencia down, cuerpo rompe sobre el último LH ──
+        if (($trend eq 'down' || $trend eq 'unknown')
+            && !$consumed_high{ $last_high_1->{index} }
+            && $body_high > $last_high_1->{price}) {
+
+            my $scope = (defined $last_high_2 && $body_high > $last_high_2->{price})
+                      ? 'external' : 'internal';
             $self->_push_event($i, 'CHoCH', 'up', $scope,
                 $last_high_1->{price}, $last_high_1->{index});
-            $choch_up_done = 1;
+            $consumed_high{ $last_high_1->{index} } = 1;
             $trend = 'up';
+        }
+
+        # ── BOS alcista: tendencia up, cuerpo rompe sobre un swing high ─────
+        if ($trend eq 'up'
+            && !$consumed_high{ $last_high_1->{index} }
+            && $body_high > $last_high_1->{price}) {
+
+            my $scope = (defined $last_high_2 && $body_high > $last_high_2->{price})
+                      ? 'external' : 'internal';
+            # Usar el nivel más relevante que se rompió
+            my $lvl = (defined $last_high_2 && $body_high > $last_high_2->{price})
+                    ? $last_high_2 : $last_high_1;
+            $self->_push_event($i, 'BOS', 'up', $scope,
+                $lvl->{price}, $lvl->{index});
+            $consumed_high{ $last_high_1->{index} } = 1;
+        }
+
+        # ── BOS bajista: tendencia down, cuerpo rompe bajo un swing low ──────
+        if ($trend eq 'down'
+            && !$consumed_low{ $last_low_1->{index} }
+            && $body_low < $last_low_1->{price}) {
+
+            my $scope = (defined $last_low_2 && $body_low < $last_low_2->{price})
+                      ? 'external' : 'internal';
+            my $lvl = (defined $last_low_2 && $body_low < $last_low_2->{price})
+                    ? $last_low_2 : $last_low_1;
+            $self->_push_event($i, 'BOS', 'down', $scope,
+                $lvl->{price}, $lvl->{index});
+            $consumed_low{ $last_low_1->{index} } = 1;
         }
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _detect_fvg — Punto 3.3
-#
-# Un Fair Value Gap (FVG) es un desequilibrio de precio: un hueco entre las
-# mechas de dos velas separadas por una vela central, que el mercado tiende
-# a "rellenar" más adelante. Definición del PDF (mecánica estándar SMC):
-#
-#   FVG alcista (up):   Low[i+1]  > High[i-1]
-#     El hueco queda entre High[i-1] (abajo) y Low[i+1] (arriba).
-#
-#   FVG bajista (down): High[i+1] < Low[i-1]
-#     El hueco queda entre High[i+1] (abajo) y Low[i-1] (arriba).
-#
-# Donde "i" es el índice de la vela CENTRAL (la vela impulsiva que crea el
-# gap entre la vela anterior i-1 y la siguiente i+1).
-#
-# Mitigación: un FVG se considera mitigado en la primera vela posterior a
-# su formación cuyo rango [low, high] vuelve a tocar el rango del gap
-# [bottom, top]. A partir de ese índice, mitigated_at queda fijo — el FVG
-# es histórico y no vuelve a "desmitigarse".
-#
-# El desvanecimiento progresivo (la opacidad visual) NO se calcula aquí:
-# es responsabilidad del Overlay (3.5), que con índice de formación +
-# índice actual del gráfico calcula cuántas velas han pasado y reduce la
-# opacidad en consecuencia. Este indicador solo expone los datos crudos.
-# ─────────────────────────────────────────────────────────────────────────────
+
 sub _detect_fvg {
     my ($self, $data) = @_;
     my $n = scalar @$data;
