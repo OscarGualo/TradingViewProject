@@ -109,6 +109,21 @@ sub new {
         # daily_proximity: hashref con la referencia de la vela diaria más
         # reciente y la posición del precio actual respecto a su cuerpo/mecha.
         daily_proximity => undef,
+
+        # ── Fibonacci Retracement levels (Fase 3) ───────────────────────────
+        # fibonacci: arrayref cronológico de hashrefs, uno por cada "pierna"
+        # entre dos swings consecutivos (ya alternados high/low por el
+        # zigzag de calculate_all):
+        #   { from => {index,price}, to => {index,price}, direction,
+        #     levels => [ {ratio, price}, ... ] }
+        #     from/to    => los dos swings que delimitan la pierna (from es
+        #                   el más antiguo cronológicamente, to el más nuevo)
+        #     direction  => 'up' (to > from) | 'down' (to < from)
+        #     levels     => niveles estándar 0/0.236/0.382/0.5/0.618/0.786/1,
+        #                   anclados con ratio=0 en el extremo MÁS RECIENTE
+        #                   (to) y ratio=1 en el extremo anterior (from) —
+        #                   convención estándar de retroceso.
+        fibonacci => [],
     };
     bless $self, $class;
     return $self;
@@ -154,6 +169,10 @@ sub _offset_indices {
             $tl->{intercept} = $p1->{price} - $tl->{slope} * $p1->{index};
         }
     }
+    for my $fib (@{ $self->{fibonacci} }) {
+        $fib->{from}{index} += $base;
+        $fib->{to}{index}   += $base;
+    }
 
     # Reconstruir los índices O(1) por vela
     $self->{swings_by_index} = {};
@@ -186,6 +205,7 @@ sub reset {
     $self->{support_resistance} = [];
     $self->{trendlines} = [];
     $self->{daily_proximity} = undef;
+    $self->{fibonacci} = [];
 }
 
 # values() devuelve el arrayref de swings — es el contrato esperado por
@@ -252,6 +272,11 @@ sub values_trendlines {
 sub daily_proximity {
     my ($self) = @_;
     return $self->{daily_proximity};
+}
+
+sub values_fibonacci {
+    my ($self) = @_;
+    return $self->{fibonacci};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,6 +394,9 @@ sub calculate_all {
     # ── Paso 7: Trendlines / Channels (líneas entre swings consecutivos) ────
     $self->_detect_trendlines();
 
+    # ── Paso 7.5: Fibonacci Retracement levels ───────────────────────────────
+    $self->_detect_fibonacci();
+
     # ── Paso 8: proximidad a la vela diaria más reciente ─────────────────────
     $self->_calc_daily_proximity($market_data, $data);
 
@@ -448,117 +476,129 @@ sub _build_bucket_index {
 sub _detect_bos_choch {
     my ($self, $data) = @_;
 
-    # ── Algoritmo alineado con LuxAlgo SMC ──────────────────────────────────
-    # Principios clave observados en TradingView:
+    # ── Versión unificada (Fase 1 del plan) ─────────────────────────────────
     #
-    # 1. ALTERNANCIA ESTRUCTURAL: la tendencia alterna entre BOS y CHoCH.
-    #    En tendencia alcista: BOS up confirman, CHoCH down señala reversión.
-    #    En tendencia bajista: BOS down confirman, CHoCH up señala reversión.
+    # Se mantiene tal cual la base de swings (Fase A/B/C de calculate_all,
+    # zigzag con alternancia estricta sobre el fractal k del PDF 4.1) — no
+    # se toca nada de eso aquí.
     #
-    # 2. UN EVENTO POR SWING: una vez que se rompe un nivel (swing_index),
-    #    ese nivel queda "consumido". No se emite otro evento para el mismo
-    #    nivel aunque el precio siga cerrando más allá.
+    # Se mantiene el criterio de "cuerpo rompe el nivel" (max(open,close) /
+    # min(open,close)) que se pidió explícitamente ("El BOS debe romper con
+    # el cuerpo") — NO se vuelve a close puro.
     #
-    # 3. CHoCH + BOS simultáneos: cuando el mismo close rompe el nivel del
-    #    CHoCH Y el del BOS, se emiten ambos — el CHoCH con el nivel del
-    #    swing contrario roto, el BOS con el nivel del swing a favor.
+    # Lo que se corrige respecto a la versión anterior:
     #
-    # 4. CUERPO de la vela: la ruptura se confirma con max(open,close) para
-    #    alcistas y min(open,close) para bajistas. Las mechas no cuentan.
+    #   1. CRUCE REAL: exige que el cuerpo de la vela ANTERIOR no rompiera
+    #      ya ese nivel. Sin esto, un pivot que aparece tarde (por el lag de
+    #      profundidad k) podía "romperse" en la primera vela evaluada aunque
+    #      el precio ya llevara tiempo por encima/debajo — generaba BOS en
+    #      lugares donde visualmente el precio "ya venía roto" desde antes.
     #
-    # 5. NIVEL CORRECTO: BOS up usa last_high_1 (el swing high más reciente),
-    #    BOS down usa last_low_1. El "external" usa el swing anterior.
+    #   2. DOS LENTES INDEPENDIENTES (internal / external): cada una con su
+    #      propio pivot activo y su propia bandera 'crossed' — una vez roto,
+    #      ese nivel nunca vuelve a generar evento hasta ser reemplazado por
+    #      un swing nuevo del mismo tipo. Antes 'consumed_high/low' se
+    #      indexaba por swing, pero external e internal compartían el mismo
+    #      trend, lo que podía clasificar mal un CHoCH/BOS cuando ambas
+    #      jerarquías estaban en momentos distintos de su ciclo.
+    #
+    #   3. TENDENCIA SEPARADA POR SCOPE: swingTrend/internalTrend equivalente
+    #      — igual que LuxAlgo, para que "internal" y "external" no se
+    #      contaminen entre sí al decidir BOS vs CHoCH.
+    #
+    # Contrato de salida sin cambios: cada evento sigue teniendo los campos
+    # {index, type, direction, scope, level_price, level_index} vía
+    # _push_event(), así que _detect_order_blocks(), el Overlay, y cualquier
+    # otro consumidor no requieren ningún cambio.
 
     my @highs = grep { $_->{type} eq 'high' } @{ $self->{swings} };
     my @lows  = grep { $_->{type} eq 'low'  } @{ $self->{swings} };
 
     my $hi_ptr = 0;
     my $lo_ptr = 0;
-    my ($last_high_1, $last_high_2);
-    my ($last_low_1,  $last_low_2);
 
-    # Índices de los swings ya "consumidos" por un evento
-    my %consumed_high;
-    my %consumed_low;
+    # Pivot = { price, index, crossed }. Uno por lado (high/low) y por lente
+    # (internal/external). 'crossed' arranca en falso cada vez que el pivot
+    # se actualiza a un swing nuevo.
+    my %pivot = (
+        internal => { high => undef, low => undef },
+        external => { high => undef, low => undef },
+    );
 
-    my $trend = 'unknown';
+    # Tendencia SEPARADA por lente (equivalente a swingTrend / internalTrend)
+    my %trend = ( internal => 'unknown', external => 'unknown' );
+
+    # Cuerpo de la vela anterior, para exigir un cruce real (no solo "está
+    # por encima/debajo"). undef en i=0.
+    my ($prev_body_high, $prev_body_low);
 
     for (my $i = 0; $i < scalar(@$data); $i++) {
 
-        # Avanzar punteros incorporando swings hasta el índice actual
+        # Avanzar punteros de swings hasta <= i. Cada nuevo swing high
+        # desplaza: external.high <- internal.high (el que antes era "el
+        # más reciente" pasa a ser "el anterior a ese"), e internal.high <-
+        # el nuevo swing. Ambos se reinician crossed=0.
         while ($hi_ptr <= $#highs && $highs[$hi_ptr]{index} <= $i) {
-            $last_high_2 = $last_high_1;
-            $last_high_1 = $highs[$hi_ptr];
+            $pivot{external}{high} = $pivot{internal}{high};
+            $pivot{internal}{high} = {
+                price => $highs[$hi_ptr]{price},
+                index => $highs[$hi_ptr]{index},
+                crossed => 0,
+            };
+            $pivot{external}{high}{crossed} = 0 if $pivot{external}{high};
             $hi_ptr++;
         }
         while ($lo_ptr <= $#lows && $lows[$lo_ptr]{index} <= $i) {
-            $last_low_2 = $last_low_1;
-            $last_low_1 = $lows[$lo_ptr];
+            $pivot{external}{low} = $pivot{internal}{low};
+            $pivot{internal}{low} = {
+                price => $lows[$lo_ptr]{price},
+                index => $lows[$lo_ptr]{index},
+                crossed => 0,
+            };
+            $pivot{external}{low}{crossed} = 0 if $pivot{external}{low};
             $lo_ptr++;
         }
 
-        next unless defined $last_high_1 && defined $last_low_1;
-
-        # Cuerpo de la vela (mechas excluidas)
+        # Cuerpo de la vela actual (mechas excluidas) — criterio pedido:
+        # "el BOS debe romper con el cuerpo".
         my $body_high = $data->[$i]{close} > $data->[$i]{open}
                       ? $data->[$i]{close} : $data->[$i]{open};
         my $body_low  = $data->[$i]{close} < $data->[$i]{open}
                       ? $data->[$i]{close} : $data->[$i]{open};
 
-        # ── CHoCH bajista: tendencia up, cuerpo rompe bajo el último HL ─────
-        if (($trend eq 'up' || $trend eq 'unknown')
-            && !$consumed_low{ $last_low_1->{index} }
-            && $body_low < $last_low_1->{price}) {
+        for my $scope (qw(internal external)) {
+            my $ph = $pivot{$scope}{high};
+            my $pl = $pivot{$scope}{low};
 
-            my $scope = (defined $last_low_2 && $body_low < $last_low_2->{price})
-                      ? 'external' : 'internal';
-            $self->_push_event($i, 'CHoCH', 'down', $scope,
-                $last_low_1->{price}, $last_low_1->{index});
-            $consumed_low{ $last_low_1->{index} } = 1;
-            $trend = 'down';
+            # Cruce alcista real: el cuerpo anterior NO rompía el nivel,
+            # el cuerpo actual sí.
+            my $crossed_up = defined($ph) && !$ph->{crossed}
+                && (!defined($prev_body_high) || $prev_body_high <= $ph->{price})
+                && $body_high > $ph->{price};
+
+            my $crossed_down = defined($pl) && !$pl->{crossed}
+                && (!defined($prev_body_low) || $prev_body_low >= $pl->{price})
+                && $body_low < $pl->{price};
+
+            if ($crossed_up) {
+                my $tag = ($trend{$scope} eq 'down') ? 'CHoCH' : 'BOS';
+                $self->_push_event($i, $tag, 'up', $scope,
+                    $ph->{price}, $ph->{index});
+                $ph->{crossed} = 1;
+                $trend{$scope} = 'up';
+            }
+
+            if ($crossed_down) {
+                my $tag = ($trend{$scope} eq 'up') ? 'CHoCH' : 'BOS';
+                $self->_push_event($i, $tag, 'down', $scope,
+                    $pl->{price}, $pl->{index});
+                $pl->{crossed} = 1;
+                $trend{$scope} = 'down';
+            }
         }
 
-        # ── CHoCH alcista: tendencia down, cuerpo rompe sobre el último LH ──
-        if (($trend eq 'down' || $trend eq 'unknown')
-            && !$consumed_high{ $last_high_1->{index} }
-            && $body_high > $last_high_1->{price}) {
-
-            my $scope = (defined $last_high_2 && $body_high > $last_high_2->{price})
-                      ? 'external' : 'internal';
-            $self->_push_event($i, 'CHoCH', 'up', $scope,
-                $last_high_1->{price}, $last_high_1->{index});
-            $consumed_high{ $last_high_1->{index} } = 1;
-            $trend = 'up';
-        }
-
-        # ── BOS alcista: tendencia up, cuerpo rompe sobre un swing high ─────
-        if ($trend eq 'up'
-            && !$consumed_high{ $last_high_1->{index} }
-            && $body_high > $last_high_1->{price}) {
-
-            my $scope = (defined $last_high_2 && $body_high > $last_high_2->{price})
-                      ? 'external' : 'internal';
-            # Usar el nivel más relevante que se rompió
-            my $lvl = (defined $last_high_2 && $body_high > $last_high_2->{price})
-                    ? $last_high_2 : $last_high_1;
-            $self->_push_event($i, 'BOS', 'up', $scope,
-                $lvl->{price}, $lvl->{index});
-            $consumed_high{ $last_high_1->{index} } = 1;
-        }
-
-        # ── BOS bajista: tendencia down, cuerpo rompe bajo un swing low ──────
-        if ($trend eq 'down'
-            && !$consumed_low{ $last_low_1->{index} }
-            && $body_low < $last_low_1->{price}) {
-
-            my $scope = (defined $last_low_2 && $body_low < $last_low_2->{price})
-                      ? 'external' : 'internal';
-            my $lvl = (defined $last_low_2 && $body_low < $last_low_2->{price})
-                    ? $last_low_2 : $last_low_1;
-            $self->_push_event($i, 'BOS', 'down', $scope,
-                $lvl->{price}, $lvl->{index});
-            $consumed_low{ $last_low_1->{index} } = 1;
-        }
+        $prev_body_high = $body_high;
+        $prev_body_low  = $body_low;
     }
 }
 
@@ -792,6 +832,51 @@ sub _detect_trendlines {
                 intercept => $intercept,
             };
         }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _detect_fibonacci — Fibonacci Retracement levels (Fase 3, cronograma 29/06:
+# "niveles de Fibonacci" — Tabla 1 y Tabla 4 del PDF).
+#
+# El PDF no fija una regla de anclaje específica para Fibonacci (a diferencia
+# de BOS/CHoCH/EQH-EQL, que sí tienen fórmulas explícitas en 4.1/4.2). Se usa
+# la convención estándar de la industria: anclar cada pierna a dos swings
+# CONSECUTIVOS de la secuencia ya alternada (misma fuente que Trendlines,
+# swings[i] -> swings[i+1]), generando una serie histórica de piernas — igual
+# patrón que _detect_trendlines, para que el Overlay pueda mostrar la más
+# reciente o cualquiera que intersecte el rango visible.
+#
+# Convención: ratio=0 en el extremo MÁS RECIENTE (to) y ratio=1 en el
+# extremo anterior (from) — así "38.2%", "61.8%", etc. representan el
+# retroceso desde el movimiento más nuevo hacia el más viejo, tal como se
+# usa en TradingView/LuxAlgo.
+# ─────────────────────────────────────────────────────────────────────────────
+my @FIB_RATIOS = (0, 0.236, 0.382, 0.5, 0.618, 0.786, 1);
+
+sub _detect_fibonacci {
+    my ($self) = @_;
+    my $swings = $self->{swings};
+    return if @$swings < 2;
+
+    for (my $i = 0; $i < $#$swings; $i++) {
+        my $from = $swings->[$i];
+        my $to   = $swings->[$i + 1];
+        next if $to->{index} == $from->{index};
+
+        my $range     = $to->{price} - $from->{price};
+        my $direction = ($range >= 0) ? 'up' : 'down';
+
+        my @levels = map {
+            { ratio => $_, price => $to->{price} - $_ * $range }
+        } @FIB_RATIOS;
+
+        push @{ $self->{fibonacci} }, {
+            from      => { index => $from->{index}, price => $from->{price} },
+            to        => { index => $to->{index},   price => $to->{price} },
+            direction => $direction,
+            levels    => \@levels,
+        };
     }
 }
 
@@ -1097,6 +1182,17 @@ sub trendlines_in_range {
     }
     # De esos, filtrar por point2.index >= start (pocos elementos pasan este test)
     return [ grep { $_->{point2}{index} >= $start } @{$arr}[0 .. $lo2] ];
+}
+
+# Fibonacci: mismo patron que trendlines_in_range -- ordenado cronologicamente
+# por construccion (se generan en el mismo orden que swings), asi que basta
+# con filtrar por interseccion de [from.index, to.index] con [start,end].
+sub fibonacci_in_range {
+    my ($self, $start, $end) = @_;
+    return [
+        grep { $_->{from}{index} <= $end && $_->{to}{index} >= $start }
+        @{ $self->{fibonacci} }
+    ];
 }
 
 1;

@@ -72,6 +72,7 @@ sub new {
             ob     => 0,   # Order Blocks
             sr     => 0,   # Support / Resistance
             trend  => 0,   # Trendlines / Channels
+            daily  => 0,   # Near daily candle's body & wick (Fase 4)
         },
     };
     bless $self, $class;
@@ -129,6 +130,9 @@ sub draw {
 
     $self->_draw_trendlines($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
         if $self->{visible}{trend};
+
+    $self->_draw_daily_proximity($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{daily};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,6 +274,140 @@ sub _draw_events {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_fvgs — STUB TEMPORAL (Fase 0: parche de emergencia)
+#
+# Antes de este stub, activar el checkbox "FVG" del menú causaba:
+#   Can't locate object method "_draw_fvgs" via package
+#   "Market::Overlays::SMC_Structures"
+# porque draw() (línea ~112) llama a este método pero nunca se implementó.
+#
+# Este stub NO dibuja nada todavía — solo evita el crash de Tk. El indicador
+# (Market::Indicators::SMC_Structures::_detect_fvg) ya calcula los datos
+# correctamente (top, bottom, direction, mitigated_at); lo que falta es
+# escribir el renderizado real con el desvanecimiento progresivo (Fase 2
+# del plan acordado). Hasta entonces, activar "FVG" en el menú es seguro
+# mostrará simplemente nada en el canvas.
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_fvgs — Punto 3.3 / cronograma 29/06: "FVG con el desvanecimiento
+# progresivo en el tiempo" (Fase 2 del plan).
+#
+# El Indicator (_detect_fvg) ya expone todo lo necesario vía fvgs_in_range():
+#   { index, direction ('up'|'down'), top, bottom, mitigated_at }
+# Este overlay SOLO decide cómo se ve — ninguna lógica de detección aquí.
+#
+# Rectángulo: desde la vela de formación (index) hasta mitigated_at (si ya
+# fue mitigado) o hasta el borde visible/cursor de replay ($end) si sigue
+# activo — mismo patrón que _draw_order_blocks.
+#
+# Desvanecimiento progresivo: Tk no soporta alpha real, así que se simula
+# con 4 escalones de -stipple (más denso = recién formado, más disperso =
+# viejo). La "edad" se mide en velas desde la formación hasta el punto de
+# referencia visible (mitigated_at si ya se mitigó, o $end si sigue activo
+# — así el desvanecimiento avanza también durante el Replay, no solo con
+# el tiempo real). Pasado 1.5x la ventana de fade, se deja de dibujar para
+# no saturar el canvas de rectángulos ya irrelevantes.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_fvgs {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    for my $fvg (@{ $smc->fvgs_in_range($start, $end) }) {
+        my $i1 = $fvg->{index};
+        my $i2 = defined $fvg->{mitigated_at} ? $fvg->{mitigated_at} : $end;
+
+        # Edad de referencia para el desvanecimiento: hasta mitigated_at si
+        # ya se rellenó (queda fijo, no sigue "envejeciendo" después), o
+        # hasta $end si sigue activo (envejece con el cursor/replay).
+        my $age = (defined $fvg->{mitigated_at} ? $fvg->{mitigated_at} : $end) - $i1;
+        next if $age > $FVG_FADE_WINDOW * 1.5;   # demasiado viejo: no saturar el canvas
+
+        $i1 = $start if $i1 < $start;
+        $i2 = $end   if $i2 > $end;
+        next if $i2 < $i1;
+
+        my $x1 = $x_of->($i1 - $start);
+        my $x2 = $x_of->($i2 - $start);
+        my $y_top = $self->{scale}->price_to_y($fvg->{top},    $min, $max, $top, $h);
+        my $y_bot = $self->{scale}->price_to_y($fvg->{bottom}, $min, $max, $top, $h);
+        next if $y_bot < $top || $y_top > $top + $h;
+
+        my $color   = $FVG_COLOR{ $fvg->{direction} } // '#787b86';
+        my $stipple = _fvg_fade_stipple($age, $FVG_FADE_WINDOW);
+
+        $canvas->createRectangle($x1, $y_top, $x2, $y_bot,
+            -fill    => $color,
+            -stipple => $stipple,
+            -outline => '',
+            -tags    => 'smc_fvg',
+        );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _fvg_fade_stipple — traduce "edad en velas" a un patrón -stipple de Tk.
+# Tk no tiene alpha real; los stipples más densos (gray50) se ven más
+# sólidos/opacos y los más dispersos (gray12) se ven más tenues/transparentes.
+# Recién formado -> denso. Con el tiempo -> cada vez más disperso.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _fvg_fade_stipple {
+    my ($age, $window) = @_;
+    my $ratio = $window > 0 ? ($age / $window) : 1;
+
+    return 'gray50' if $ratio < 0.33;   # recién formado: más opaco
+    return 'gray25' if $ratio < 0.66;   # medio de vida
+    return 'gray12';                    # cerca de desaparecer: más transparente
+}
+
+sub _draw_fibonacci {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    # Decisión de diseño: mostrar solo la PIERNA MÁS RECIENTE que intersecta
+    # el rango visible (no todo el historial de piernas) — igual convención
+    # que las herramientas de Fibonacci automáticas de TradingView/LuxAlgo,
+    # para no saturar el canvas con decenas de retrocesos históricos.
+    # fibonacci_in_range() devuelve en orden cronológico (mismo orden que se
+    # generaron los swings), así que el último elemento es el más reciente.
+    my $legs = $smc->fibonacci_in_range($start, $end);
+    return unless @$legs;
+    my $leg = $legs->[-1];
+
+    my $right = $state->{right} // $x_of->($end - $start);
+    my $fi = $leg->{from}{index} < $start ? $start : $leg->{from}{index};
+    my $x1 = $x_of->($fi - $start);
+
+    # Colores: 0/100% en gris neutro (extremos del rango), 50%/61.8% (Fib
+    # "golden ratio") destacados, el resto en un tono intermedio.
+    my %ratio_color = (
+        '0.000' => '#787b86',
+        '1.000' => '#787b86',
+        '0.500' => '#f0b90b',
+        '0.618' => '#f0b90b',
+    );
+
+    for my $lvl (@{ $leg->{levels} }) {
+        my $y = $self->{scale}->price_to_y($lvl->{price}, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        my $key   = sprintf('%.3f', $lvl->{ratio});
+        my $color = $ratio_color{$key} // '#5b9cff';
+
+        $canvas->createLine($x1, $y, $right, $y,
+            -fill  => $color,
+            -width => 1,
+            -dash  => [3, 2],
+            -tags  => 'smc_fib',
+        );
+        $canvas->createText($right - 4, $y - 7,
+            -anchor => 'e',
+            -text   => sprintf('%.1f%%', $lvl->{ratio} * 100),
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'smc_fib',
+        );
+    }
+}
+
 sub _draw_order_blocks {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
@@ -376,6 +514,96 @@ sub _draw_trendlines {
             -fill  => $color,
             -width => 1,
             -tags  => 'smc_trend',
+        );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_daily_proximity — cronograma 29/06: "Near daily candle's body & wick"
+# (Fase 4 del plan).
+#
+# El Indicator (_calc_daily_proximity) ya expone daily_proximity() con:
+#   { daily_index, body_top, body_bottom, wick_top, wick_bottom,
+#     current_price, zone, distance_to_body }
+# No es un dato "por vela" del TF activo — es una referencia de la vela
+# DIARIA más reciente, igual que "Previous Day High/Low" en TradingView, así
+# que se dibuja como líneas horizontales de referencia que cruzan todo el
+# ancho visible, no ancladas a un índice de vela concreto.
+#
+# Cuerpo (body_top/body_bottom) en trazo sólido más grueso; mecha
+# (wick_top/wick_bottom) en trazo punteado más fino — para diferenciar
+# visualmente cuerpo vs mecha tal como pide la Tabla 4.
+# ─────────────────────────────────────────────────────────────────────────────
+my $COLOR_DAILY_BODY = '#5b9cff';
+my $COLOR_DAILY_WICK = '#5b9cff';
+
+sub _draw_daily_proximity {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    my $dp = $smc->daily_proximity();
+    return unless defined $dp;
+
+    my $left  = $state->{left}  // $x_of->(0);
+    my $right = $state->{right} // $x_of->($end - $start);
+
+    # ── Mecha (wick_top / wick_bottom): punteado fino ───────────────────────
+    for my $pair (
+        [ $dp->{wick_top},    'PDH wick' ],
+        [ $dp->{wick_bottom}, 'PDL wick' ],
+    ) {
+        my ($price, $label) = @$pair;
+        my $y = $self->{scale}->price_to_y($price, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        $canvas->createLine($left, $y, $right, $y,
+            -fill  => $COLOR_DAILY_WICK,
+            -width => 1,
+            -dash  => [2, 3],
+            -tags  => 'smc_daily',
+        );
+        $canvas->createText($right - 4, $y - 7,
+            -anchor => 'e',
+            -text   => $label,
+            -fill   => $COLOR_DAILY_WICK,
+            -font   => ['Arial', 7],
+            -tags   => 'smc_daily',
+        );
+    }
+
+    # ── Cuerpo (body_top / body_bottom): sólido, más grueso ─────────────────
+    for my $pair (
+        [ $dp->{body_top},    'PD body top' ],
+        [ $dp->{body_bottom}, 'PD body bot' ],
+    ) {
+        my ($price, $label) = @$pair;
+        my $y = $self->{scale}->price_to_y($price, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        $canvas->createLine($left, $y, $right, $y,
+            -fill  => $COLOR_DAILY_BODY,
+            -width => 2,
+            -tags  => 'smc_daily',
+        );
+        $canvas->createText($right - 4, $y - 7,
+            -anchor => 'e',
+            -text   => $label,
+            -fill   => $COLOR_DAILY_BODY,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'smc_daily',
+        );
+    }
+
+    # ── Etiqueta de zona actual (above_wick / in_upper_wick / in_body / ... )
+    # cerca del precio actual, para responder visualmente "dónde estoy
+    # respecto a la vela diaria" sin tener que leer números.
+    my $y_cur = $self->{scale}->price_to_y($dp->{current_price}, $min, $max, $top, $h);
+    if ($y_cur >= $top && $y_cur <= $top + $h) {
+        $canvas->createText($left + 4, $y_cur,
+            -anchor => 'w',
+            -text   => 'Daily: ' . $dp->{zone},
+            -fill   => $COLOR_DAILY_BODY,
+            -font   => ['Arial', 7, 'italic'],
+            -tags   => 'smc_daily',
         );
     }
 }
