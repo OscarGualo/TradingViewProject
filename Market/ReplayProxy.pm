@@ -58,8 +58,33 @@ sub get_slice {
 # Todos los métodos no sobreescritos se delegan automáticamente.
 
 sub get_candle      { $_[0]->{_market}->get_candle($_[1]); }
-sub get_tf_data     { $_[0]->{_market}->get_tf_data($_[1]); }
-sub get_tf_slice    { $_[0]->{_market}->get_tf_slice($_[1], $_[2], $_[3]); }
+
+# ── FIX (bug #1): get_tf_data/get_tf_slice ya NO delegan directo al market
+# real sin acotar. Antes, un indicador que pidiera contexto de un TF
+# superior (ej. proyectar niveles 4H sobre una ventana 1m, como exige el
+# PDF punto 3) recibía velas de esa temporalidad más allá del cursor de
+# Replay — filtración de velas futuras "por la puerta de atrás" del TF
+# activo. Ahora se acotan por el epoch de la última vela visible
+# ($self->last_index(), ya recortado por el cursor), usando
+# get_tf_data_upto()/get_tf_slice_upto() de MarketData, que además
+# reconstruyen la vela HTF "en formación" usando solo los minutos ya
+# transcurridos hasta ese instante (no toda la vela precalculada).
+sub _cursor_epoch {
+    my ($self) = @_;
+    my $c = $self->{_market}->get_candle($self->last_index());
+    return defined $c ? $c->{epoch} : undef;
+}
+
+sub get_tf_data {
+    my ($self, $tf) = @_;
+    return $self->{_market}->get_tf_data_upto($tf, $self->_cursor_epoch());
+}
+
+sub get_tf_slice {
+    my ($self, $tf, $start, $end) = @_;
+    return $self->{_market}->get_tf_slice_upto($tf, $start, $end, $self->_cursor_epoch());
+}
+
 sub get_timeframe   { $_[0]->{_market}->get_timeframe(); }
 sub get_timestamp   { $_[0]->{_market}->get_timestamp($_[1]); }
 sub get_data        { $_[0]->{_market}->get_data(); }
@@ -112,10 +137,28 @@ sub get_slice {
 sub get_candle  { return $_[0]->{_market}->get_candle($_[0]->{_base} + $_[1]); }
 sub last_candle { return $_[0]->{_market}->get_candle($_[0]->{_cursor}); }
 
-# Delegación (TF superiores y timeframe activo no dependen de la ventana 1m).
+# ── FIX (bug #1): mismo problema que en ReplayProxy — get_tf_data/
+# get_tf_slice delegaban sin acotar al cursor. Se corrige igual, acotando
+# por el epoch de la vela en $self->{_cursor} (índice global del cursor
+# de replay/ventana) vía get_tf_data_upto()/get_tf_slice_upto().
+sub _cursor_epoch {
+    my ($self) = @_;
+    my $c = $self->{_market}->get_candle($self->{_cursor});
+    return defined $c ? $c->{epoch} : undef;
+}
+
+sub get_tf_data {
+    my ($self, $tf) = @_;
+    return $self->{_market}->get_tf_data_upto($tf, $self->_cursor_epoch());
+}
+
+sub get_tf_slice {
+    my ($self, $tf, $start, $end) = @_;
+    return $self->{_market}->get_tf_slice_upto($tf, $start, $end, $self->_cursor_epoch());
+}
+
+# Delegación (timeframe activo no depende de la ventana 1m).
 sub get_timeframe        { $_[0]->{_market}->get_timeframe(); }
-sub get_tf_data          { $_[0]->{_market}->get_tf_data($_[1]); }
-sub get_tf_slice         { $_[0]->{_market}->get_tf_slice($_[1], $_[2], $_[3]); }
 sub get_timestamp        { $_[0]->{_market}->get_timestamp($_[0]->{_base} + $_[1]); }
 sub get_data             { $_[0]->{_market}->get_data(); }
 sub available_timeframes { $_[0]->{_market}->available_timeframes(); }

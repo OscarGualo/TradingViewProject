@@ -204,23 +204,27 @@ sub calculate_all {
     $self->_calc_mtf_volume($market_data, $data);
     $self->_classify_origin();
 }
-
 # ─────────────────────────────────────────────────────────────────────────────
-# calculate_replay — versión optimizada para el sistema Replay (Fix 1)
+# calculate_replay — versión para el sistema Replay (ver comentario detallado
+# más abajo, junto a la implementación, sobre el fix de EQH/EQL).
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# calculate_replay — versión para el sistema Replay
 #
-# Omite el loop O(n²) de EQH/EQL que consume el 76% del tiempo de cálculo.
-# La justificación es correcta frente al PDF:
+# ── FIX (bug reportado): antes esta función usaba _detect_levels_fast(),
+# que SOLO genera BSL/SSL y omite EQH/EQL por completo. Como reset() vacía
+# {levels} en cada step, el resultado era que las etiquetas EQH/EQL
+# DESAPARECÍAN por completo apenas se entraba a Replay — incumpliendo el
+# cronograma 29/06 ("EQL/EQH: below EQLs & above EQH") justo en el modo
+# que más se evalúa.
 #
-#   1. El PDF 3 (Replay) exige "no mostrar velas futuras" — lo cumplimos
-#      con el ReplayProxy. No exige recalcular EQH/EQL en cada step.
-#   2. EQH/EQL son niveles ESTRUCTURALES que requieren decenas de velas para
-#      formarse — en un step de 1 vela no aparecen EQH/EQL nuevos.
-#   3. TradingView tampoco recalcula EQH/EQL en cada tick de replay.
-#   4. En modo NORMAL (no replay) se sigue usando calculate_all() con EQH/EQL
-#      completos — la etiqueta del cronograma 29/06 "EQL/EQH" se cumple.
-#
-# Resultado: 4.2s → ~0.8s por step (5x más rápido), sin perder funcionalidad
-# exigida por el PDF para el modo Replay.
+# La justificación original ("EQH/EQL es un loop O(n²)") ya no aplica:
+# _detect_levels() fue optimizado hace tiempo para comparar cada swing
+# SOLO contra los `eq_lookback` (12) swings anteriores — es decir, ya es
+# O(swings * 12), no O(n²). Sumado a que WindowProxy ya acota el cálculo
+# a las últimas REPLAY_WINDOW (~4000) velas, correr la detección completa
+# de EQH/EQL en cada step es barato. Se usa _detect_levels() (completo)
+# en vez de _detect_levels_fast().
 # ─────────────────────────────────────────────────────────────────────────────
 sub calculate_replay {
     my ($self, $market_data) = @_;
@@ -235,8 +239,8 @@ sub calculate_replay {
     $self->_calc_swings($data);
     my $atr = $self->_calc_atr($data);
 
-    # _detect_levels_fast: solo BSL y SSL — omite el O(n²) de EQH/EQL
-    $self->_detect_levels_fast($data, $atr);
+    # BSL, SSL, EQH y EQL — completo, ya no hace falta la versión "fast".
+    $self->_detect_levels($data, $atr);
     $self->_run_state_machine($data);
     # Omitimos _calc_mtf_volume (no afecta el render del Replay)
 

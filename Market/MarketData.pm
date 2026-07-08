@@ -216,7 +216,111 @@ sub get_tf_slice {
     return [ @$a[$start .. $end] ];
 }
 
+# Binary search: índice del último elemento en $arr (ordenado por epoch)
+# con epoch <= $target. Devuelve -1 si ninguno cumple.
+sub _bsearch_epoch_le {
+    my ($arr, $target) = @_;
+    return -1 if !@$arr || $arr->[0]{epoch} > $target;
+    my ($lo, $hi) = (0, $#$arr);
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi + 1) / 2);
+        $arr->[$mid]{epoch} > $target ? ($hi = $mid - 1) : ($lo = $mid);
+    }
+    return $lo;
+}
+
+# get_tf_data_upto — versión de get_tf_data() que NUNCA filtra velas
+# futuras a $cursor_epoch, ni siquiera dentro de la vela HTF que está
+# "en formación" en ese instante.
+#
+# Motivo: build_tf_candles() agrega TODO el histórico 1m de una sola vez,
+# así que la última vela de un TF superior (ej. la vela 4H que contiene al
+# cursor de Replay) puede tener su high/low/close calculados con minutos
+# que, en el instante del Replay, todavía no han "sucedido". Este método
+# reconstruye esa última vela usando solo las velas de 1m con
+# epoch <= $cursor_epoch — igual que se vería en un feed en vivo detenido
+# exactamente en ese punto.
+sub get_tf_data_upto {
+    my ($self, $tf, $cursor_epoch) = @_;
+    return $self->get_tf_data($tf) unless defined $cursor_epoch;
+
+    # TF 1: filtrado directo por epoch, sin reconstrucción de buckets.
+    if ($tf eq '1' || ($tf =~ /^\d+$/ && $tf == 1)) {
+        my $arr = $self->{data}{1};
+        my $idx = _bsearch_epoch_le($arr, $cursor_epoch);
+        return [] if $idx < 0;
+        return [ @$arr[0 .. $idx] ];
+    }
+
+    my $tf_arr = $self->get_tf_data($tf);
+    return [] unless @$tf_arr;
+
+    my $bidx = _bsearch_epoch_le($tf_arr, $cursor_epoch);
+    return [] if $bidx < 0;
+
+    my @out = @$tf_arr[0 .. $bidx];
+
+    # ¿El último bucket devuelto sigue "en formación" en el instante del
+    # cursor (todavía no llegó a bucket_start + duración)? Si es así, hay
+    # que reconstruirlo solo con los 1m ya "sucedidos".
+    my $minutes      = $TF_MINUTES{$tf} // ($tf + 0);
+    my $bucket_start = $out[-1]{epoch};
+    my $bucket_end   = $bucket_start + $minutes * 60;
+
+    if ($cursor_epoch < $bucket_end - 1) {
+        my $m1 = $self->{data}{1};
+        my $lo = _bsearch_epoch_le($m1, $bucket_start - 1) + 1;  # primer 1m del bucket
+        $lo = 0 if $lo < 0;
+        my $hi = _bsearch_epoch_le($m1, $cursor_epoch);
+
+        if ($hi >= $lo) {
+            my $live;
+            for my $c (@$m1[$lo .. $hi]) {
+                if (!defined $live) {
+                    $live = {
+                        time => $c->{time}, epoch => $bucket_start,
+                        open => $c->{open}, high => $c->{high},
+                        low  => $c->{low},  close => $c->{close},
+                        volume => $c->{volume},
+                    };
+                } else {
+                    $live->{high}   = $c->{high}  if $c->{high} > $live->{high};
+                    $live->{low}    = $c->{low}   if $c->{low}  < $live->{low};
+                    $live->{close}  = $c->{close};
+                    $live->{volume} += $c->{volume};
+                }
+            }
+            $out[-1] = $live if $live;
+        } else {
+            # No hay ni una sola vela 1m del bucket todavía "sucedida":
+            # el bucket no debería mostrarse en absoluto.
+            pop @out;
+        }
+    }
+
+    return \@out;
+}
+
+# get_tf_slice_upto — equivalente a get_tf_slice() pero apoyado en
+# get_tf_data_upto() para respetar el límite de $cursor_epoch.
+sub get_tf_slice_upto {
+    my ($self, $tf, $start, $end, $cursor_epoch) = @_;
+    my $a = $self->get_tf_data_upto($tf, $cursor_epoch);
+    $start = 0    if $start < 0;
+    $end   = $#$a if $end > $#$a;
+    return []     if $end < $start || !@$a;
+    return [ @$a[$start .. $end] ];
+}
+
 sub get_candle     { return $_[0]->_active_array()->[$_[1]]; }
+
+# index_at_epoch — índice del último candle del TF ACTIVO con epoch <= $epoch.
+# Se usa para reproyectar el cursor de Replay al cambiar de temporalidad
+# (los índices de un TF no significan lo mismo en otro TF).
+sub index_at_epoch {
+    my ($self, $epoch) = @_;
+    return _bsearch_epoch_le($self->_active_array(), $epoch);
+}
 sub size           { return scalar @{$_[0]->_active_array()}; }
 sub last_index     { return $_[0]->size() - 1; }
 sub last_candle    { return $_[0]->_active_array()->[-1]; }

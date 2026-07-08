@@ -999,10 +999,51 @@ sub _replay_update_play_btn {
 
 sub set_timeframe {
     my ($self, $tf) = @_;
+
+    # ── FIX: set_timeframe() ignoraba el Replay ──────────────────────────
+    # Antes, cambiar de temporalidad SIEMPRE llamaba a
+    # $indicators->update_last($self->{market}) con el market SIN acotar,
+    # sin importar si $self->{replay_mode} estaba activo. Eso recalculaba
+    # SMC/Liquidity/ZigZag con el dataset COMPLETO — fuga de velas futuras
+    # exactamente en el caso "cambio de TF durante un Replay en curso".
+    #
+    # Además, replay_cursor es un índice de la TF ANTERIOR; los índices no
+    # significan lo mismo en la TF nueva, así que hay que reproyectarlo por
+    # tiempo (epoch) antes de recalcular, para no perder ni adelantar el
+    # punto exacto donde estaba el Replay.
+    my $old_cursor_epoch;
+    if ($self->{replay_mode}) {
+        my $c = $self->{market}->get_candle($self->{replay_cursor});
+        $old_cursor_epoch = $c->{epoch} if defined $c;
+    }
+
     $self->{tf} = $tf;
     $self->{market}->set_timeframe($tf);
     $self->{indicators}->reset_all();
-    $self->{indicators}->update_last($self->{market});
+
+    # ATR es causal (solo mira hacia atrás): recalcularlo sobre el market
+    # completo NUNCA filtra futuro, se haga o no Replay, así que siempre se
+    # recalcula igual que antes.
+    my $atr = $self->{indicators}->get_indicator('ATR');
+    $atr->calculate_all($self->{market}) if defined $atr;
+
+    if ($self->{replay_mode}) {
+        # Reproyectar el cursor a la nueva TF por epoch.
+        if (defined $old_cursor_epoch) {
+            my $new_idx = $self->{market}->index_at_epoch($old_cursor_epoch);
+            $self->{replay_cursor} = $new_idx >= 0 ? $new_idx : 0;
+        }
+        my $total = $self->{market}->last_index();
+        $self->{replay_cursor} = 0     if $self->{replay_cursor} < 0;
+        $self->{replay_cursor} = $total if $self->{replay_cursor} > $total;
+
+        # Recalcula SMC/Liquidity/ZigZag* acotados al cursor (WindowProxy),
+        # igual que cualquier otro paso del Replay — sin fuga de futuro.
+        $self->_replay_recalc_indicators();
+    } else {
+        $self->{indicators}->update_last($self->{market});
+    }
+
     $self->{locked_index} = undef;
     $self->{lock_y_on_zoom} = 0;
     $self->fit_all();
