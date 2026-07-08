@@ -139,6 +139,13 @@ sub draw {
 # _draw_swings — etiquetas HH/HL/LH/LL sobre cada Swing Point visible.
 # Se dibujan primero los FVG (capa de fondo) para que las etiquetas queden
 # siempre legibles encima.
+#
+# ── FIX (retroalimentación del profesor: "limpiar HH, LH, HL, LL") ────────
+# Antes se dibujaban TODOS los swings internos (k=5) — verificado: 2,581
+# etiquetas en el histórico de prueba, ilegibles al alejar el zoom (ver
+# capturas de referencia). Ahora se dibujan los major_swings (k=50,
+# estructura externa/mayor) — reduce la densidad ~10x, mismo criterio ya
+# aplicado a Order Blocks, Trendlines y Fibonacci.
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_swings {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
@@ -148,7 +155,7 @@ sub _draw_swings {
     #   - Etiqueta del label (HH/HL/LH/LL) justo encima/debajo de esa línea
     #   - Colores: verde para HH/HL (alcista), rojo/cyan para LH/LL (bajista)
     #   - Solo sobre la mecha: high para swing highs, low para swing lows
-    my $swings = $smc->swings_in_range($start, $end);
+    my $swings = $smc->major_swings_in_range($start, $end);
     for my $sw (@$swings) {
         my $x = $x_of->($sw->{index} - $start);
         my $y = $self->{scale}->price_to_y($sw->{price}, $min, $max, $top, $h);
@@ -182,6 +189,20 @@ sub _draw_swings {
 # _draw_events — marcadores BOS y CHoCH.
 # internal: línea sólida corta + etiqueta. external: línea punteada + etiqueta
 # con sufijo, distinción visual exigida por la jerarquía multi-temporal del PDF.
+#
+# ── FIX (retroalimentación del profesor: "se mezcla BOS con LL,LH. BOS
+# encima de la vela.") ──────────────────────────────────────────────────
+# Causa encontrada: el label del swing (HH/LH/HL/LL, en _draw_swings) se
+# dibuja a precio_swing±14px, y el label de BOS/CHoCH se dibujaba a
+# precio_del_MISMO_nivel±9px — ambos anclados prácticamente al mismo precio,
+# apenas 5px de diferencia, así que se superponían. Además el label se
+# ubicaba en el punto medio del segmento nivel→ruptura; con niveles
+# recién formados (lo más común dada la densidad anterior), ese punto medio
+# caía casi encima de la vela que rompe.
+# Fix: (a) separación de Y mucho mayor (±20px en vez de ±9px) para que no
+# choque con el label del swing: (b) el label se ancla cerca del BORDE
+# DERECHO del segmento (la vela de ruptura + un pequeño margen), no en el
+# centro — es el patrón estándar de TradingView/LuxAlgo.
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_events {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
@@ -259,9 +280,13 @@ sub _draw_events {
 
             $canvas->createLine($x1, $y, $x2, $y, @line_args);
 
-            # ── Etiqueta al centro del segmento ──────────────────────────────
-            my $label_x = ($x1 + $x2) / 2;
-            my $label_y = ($ev->{direction} eq 'up') ? ($y - 9) : ($y + 9);
+            # ── Etiqueta cerca del borde derecho (vela de ruptura) ────────────
+            # Antes: label_x = punto medio del segmento -> quedaba encima de
+            # la vela cuando el nivel era reciente. Ahora: cerca de x2 con un
+            # pequeño margen hacia la izquierda, y separación de Y mayor
+            # (±20px) para no chocar con la etiqueta HH/LH del swing (±14px).
+            my $label_x = $x2 - 12;
+            my $label_y = ($ev->{direction} eq 'up') ? ($y - 20) : ($y + 20);
             $canvas->createText($label_x, $label_y,
                 -text   => $label,
                 -fill   => $color,

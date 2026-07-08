@@ -38,15 +38,33 @@ use warnings;
 sub new {
     my ($class, %args) = @_;
     my $self = {
-        # Profundidad de vecindad para detectar un swing.
-        # PDF 4.1: "valor inicial recomendado k = 3"
+        # Profundidad de vecindad para detectar un swing INTERNO (estructura
+        # menor). PDF 4.1: "valor inicial recomendado k = 3"
         depth => $args{depth} // 5,   # LuxAlgo default para 1m: 5
+
+        # ── FIX (retroalimentación del profesor: "limpiar HH/HL/LH/LL",
+        # "OB debe ser más externo", "corregir trendlines") ────────────────
+        # Profundidad de vecindad para la estructura EXTERNA/MAYOR — una
+        # detección de swings genuinamente más gruesa, independiente de la
+        # interna, igual que LuxAlgo real (Internal Structure length=5 vs
+        # Swing Structure length=50, ver ScriptSMCSTRUCTURES.txt). Antes
+        # "external" era solo "el swing anterior al más reciente" del MISMO
+        # set de swings k=5 — no reducía el ruido en absoluto. Ahora es una
+        # segunda pasada de detección con k mucho mayor.
+        major_depth => $args{major_depth} // 50,   # LuxAlgo "Swing Length" default: 50
 
         # Resultado del último calculate_all():
         #   swings: arrayref de hashrefs { index, price, type, label }
         #     type  => 'high' | 'low'           (Swing High o Swing Low)
         #     label => 'HH' | 'HL' | 'LH' | 'LL' (clasificación de tendencia)
         swings => [],
+
+        # major_swings: mismo formato que swings, pero con major_depth.
+        # Es la base real de: etiquetas HH/HL/LH/LL "limpias" que dibuja el
+        # Overlay, BOS/CHoCH de scope 'external', Order Blocks (que ya solo
+        # se generan desde 'external'), Trendlines y Fibonacci.
+        major_swings => [],
+        major_swings_by_index => {},
 
         # Índice de vela -> swing en ese índice (acceso O(1) para overlays)
         # Solo las velas que SON un swing point tienen entrada aquí.
@@ -140,6 +158,7 @@ sub _offset_indices {
     return if !$base;
 
     for my $sw (@{ $self->{swings} }) { $sw->{index} += $base; }
+    for my $sw (@{ $self->{major_swings} }) { $sw->{index} += $base; }
     for my $ev (@{ $self->{events} }) {
         $ev->{index}       += $base;
         $ev->{level_index} += $base if defined $ev->{level_index};
@@ -177,6 +196,8 @@ sub _offset_indices {
     # Reconstruir los índices O(1) por vela
     $self->{swings_by_index} = {};
     $self->{swings_by_index}{ $_->{index} } = $_ for @{ $self->{swings} };
+    $self->{major_swings_by_index} = {};
+    $self->{major_swings_by_index}{ $_->{index} } = $_ for @{ $self->{major_swings} };
     $self->{events_by_index} = {};
     for my $ev (@{ $self->{events} }) {
         my $k = $ev->{index};
@@ -196,6 +217,8 @@ sub reset {
     my ($self) = @_;
     $self->{swings} = [];
     $self->{swings_by_index} = {};
+    $self->{major_swings} = [];
+    $self->{major_swings_by_index} = {};
     $self->{events} = [];
     $self->{events_by_index} = {};
     $self->{fvgs} = [];
@@ -221,6 +244,19 @@ sub values {
 sub swing_at {
     my ($self, $index) = @_;
     return $self->{swings_by_index}{$index};
+}
+
+# values_major_swings() / major_swing_at() — equivalentes a values()/swing_at()
+# pero para la estructura EXTERNA (major_swings, k=major_depth). Es la fuente
+# que usa el Overlay para dibujar las etiquetas HH/HL/LH/LL "limpias".
+sub values_major_swings {
+    my ($self) = @_;
+    return $self->{major_swings};
+}
+
+sub major_swing_at {
+    my ($self, $index) = @_;
+    return $self->{major_swings_by_index}{$index};
 }
 
 # Devuelve el evento (BOS/CHoCH) confirmado en una vela específica, o undef.
@@ -280,6 +316,94 @@ sub values_fibonacci {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _detect_swings_at_depth — Fases A+B (candidatos + zigzag con alternancia
+# estricta), parametrizado por profundidad $k. Reutilizado para generar tanto
+# la estructura interna (k pequeño) como la externa/mayor (k grande) —
+# exactamente el mismo algoritmo, solo cambia la vecindad de comparación.
+# Devuelve el zigzag SIN etiquetar (sin HH/HL/LH/LL todavía).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _detect_swings_at_depth {
+    my ($self, $run_data, $rn, $k) = @_;
+
+    # Fase A: candidatos extremo local
+    my @cand;
+    for (my $i = $k; $i <= $rn - 1 - $k; $i++) {
+        my $c = $run_data->[$i];
+
+        my $is_high = 1;
+        for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
+            if ($run_data->[$j]{high} >= $c->{high}) { $is_high = 0; last; }
+        }
+        if ($is_high) {
+            push @cand, { index => $i, price => $c->{high}, type => 'high' };
+            next;
+        }
+
+        my $is_low = 1;
+        for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
+            if ($run_data->[$j]{low} <= $c->{low}) { $is_low = 0; last; }
+        }
+        if ($is_low) {
+            push @cand, { index => $i, price => $c->{low}, type => 'low' };
+        }
+    }
+
+    # Fase B: zigzag con alternancia estricta — en rachas del mismo tipo
+    # conservar solo el extremo más pronunciado. Produce high/low/high/...
+    my @zz;
+    for my $c (@cand) {
+        if (!@zz) { push @zz, $c; next; }
+        my $last = $zz[-1];
+        if ($last->{type} eq $c->{type}) {
+            if ($c->{type} eq 'high') {
+                $zz[-1] = $c if $c->{price} > $last->{price};
+            } else {
+                $zz[-1] = $c if $c->{price} < $last->{price};
+            }
+        } else {
+            push @zz, $c;
+        }
+    }
+    return \@zz;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _label_and_store_swings — Fase C: etiqueta HH/HL/LH/LL comparando cada
+# swing con el anterior del MISMO array de zigzag (self-contenido: la
+# estructura interna y la externa mantienen su propia clasificación de
+# tendencia, no se mezclan entre sí). Escribe en $target_arr/$target_idx.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _label_and_store_swings {
+    my ($self, $zz, $target_arr, $target_idx) = @_;
+    my $last_high;
+    my $last_low;
+
+    for my $sw (@$zz) {
+        my $label;
+        if ($sw->{type} eq 'high') {
+            $label = defined $last_high
+                   ? ($sw->{price} > $last_high->{price} ? 'HH' : 'LH')
+                   : 'HH';
+            $last_high = $sw;
+        } else {
+            $label = defined $last_low
+                   ? ($sw->{price} > $last_low->{price} ? 'HL' : 'LL')
+                   : 'LL';
+            $last_low = $sw;
+        }
+
+        my $entry = {
+            index => $sw->{index},
+            price => $sw->{price},
+            type  => $sw->{type},
+            label => $label,
+        };
+        push @$target_arr, $entry;
+        $target_idx->{ $sw->{index} } = $entry;
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # calculate_all — recalcula todos los Swing Points y su clasificación
 # HH/HL/LH/LL desde cero, sobre los datos visibles en $market_data.
 #
@@ -332,106 +456,49 @@ sub calculate_all {
 
     # ── Paso 1 + 2: Swing Points con alternancia forzada (estilo LuxAlgo) ──────
     #
-    # Algoritmo en dos fases (corre sobre $run_data = warmup + ventana):
-    #   A) Candidatos: velas que son extremo local dentro de la ventana ±k.
-    #   B) Zigzag con alternancia estricta: en rachas del mismo tipo (high/high
-    #      o low/low) conservar solo el extremo más pronunciado. Esto produce
-    #      una secuencia high→low→high→... limpia, igual que LuxAlgo SMC.
-    #
-    # Esto elimina el 99% de las etiquetas duplicadas/consecutivas y produce
-    # la misma densidad visual que TradingView (5-10 swings en 200 velas).
+    # ── FIX (retroalimentación del profesor: "limpiar HH/HL/LH/LL", "OB debe
+    # ser más externo", "corregir trendlines") ─────────────────────────────
+    # Se corre la MISMA detección dos veces con profundidades distintas,
+    # igual que LuxAlgo real (Internal Structure k=5, Swing Structure k=50):
+    #   - {swings}       (k = depth,       interno — estructura menor)
+    #   - {major_swings} (k = major_depth, externo — estructura mayor)
+    # Antes solo existía una detección (k=5) y "external" era un truco
+    # ("el swing anterior al más reciente" del MISMO set) — no reducía el
+    # ruido. Ahora major_swings es una segunda pasada independiente sobre
+    # una vecindad mucho más ancha, produciendo ~10x menos puntos — la base
+    # real de las etiquetas HH/HL/LH/LL "limpias", BOS/CHoCH externo, Order
+    # Blocks, Trendlines y Fibonacci.
+    my @zz_internal = @{ $self->_detect_swings_at_depth($run_data, $rn, $k) };
+    $self->_label_and_store_swings(\@zz_internal, $self->{swings}, $self->{swings_by_index});
 
-    # Fase A: candidatos extremo local
-    my @cand;
-    for (my $i = $k; $i <= $rn - 1 - $k; $i++) {
-        my $c = $run_data->[$i];
-
-        my $is_high = 1;
-        for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
-            if ($run_data->[$j]{high} >= $c->{high}) { $is_high = 0; last; }
-        }
-        if ($is_high) {
-            push @cand, { index => $i, price => $c->{high}, type => 'high' };
-            next;
-        }
-
-        my $is_low = 1;
-        for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
-            if ($run_data->[$j]{low} <= $c->{low}) { $is_low = 0; last; }
-        }
-        if ($is_low) {
-            push @cand, { index => $i, price => $c->{low}, type => 'low' };
-        }
-    }
-
-    # Fase B: zigzag con alternancia estricta
-    # En rachas del mismo tipo conservar el extremo más pronunciado (igual
-    # que hace el ZZMTF). Produce secuencia limpia high/low/high/...
-    my @zz;
-    for my $c (@cand) {
-        if (!@zz) { push @zz, $c; next; }
-        my $last = $zz[-1];
-        if ($last->{type} eq $c->{type}) {
-            # mismo tipo: conservar el más extremo
-            if ($c->{type} eq 'high') {
-                $zz[-1] = $c if $c->{price} > $last->{price};
-            } else {
-                $zz[-1] = $c if $c->{price} < $last->{price};
-            }
-        } else {
-            push @zz, $c;
-        }
-    }
-
-    # Fase C: etiquetar HH/HL/LH/LL comparando cada swing con el anterior
-    # del mismo tipo (igual que antes pero ahora la serie ya está alternada).
-    # Con warm-up, los primeros swings de esta secuencia caen DENTRO del
-    # warm-up, así que cuando lleguemos al primer swing DENTRO de la ventana
-    # real, $last_high/$last_low ya traen el contexto correcto.
-    my $last_high;
-    my $last_low;
-
-    for my $sw (@zz) {
-        my $label;
-        if ($sw->{type} eq 'high') {
-            $label = defined $last_high
-                   ? ($sw->{price} > $last_high->{price} ? 'HH' : 'LH')
-                   : 'HH';
-            $last_high = $sw;
-        } else {
-            $label = defined $last_low
-                   ? ($sw->{price} > $last_low->{price} ? 'HL' : 'LL')
-                   : 'LL';
-            $last_low = $sw;
-        }
-
-        my $entry = {
-            index => $sw->{index},
-            price => $sw->{price},
-            type  => $sw->{type},
-            label => $label,
-        };
-        push @{ $self->{swings} }, $entry;
-        $self->{swings_by_index}{ $sw->{index} } = $entry;
+    my $mk = $self->{major_depth};
+    if ($rn >= (2 * $mk + 1)) {
+        my @zz_major = @{ $self->_detect_swings_at_depth($run_data, $rn, $mk) };
+        $self->_label_and_store_swings(\@zz_major, $self->{major_swings}, $self->{major_swings_by_index});
     }
 
     # ── Paso 3: detección de BOS y CHoCH (sobre $run_data: el estado de
-    #    tendencia interno/externo también hereda contexto del warm-up) ──────
+    #    tendencia interno/externo también hereda contexto del warm-up).
+    #    Internal usa {swings} (k=5), external usa {major_swings} (k=50) —
+    #    dos pasadas independientes, cada una con su propio pivote/tendencia.
     $self->_detect_bos_choch($run_data);
 
     # ── Paso 4: detección de Fair Value Gaps ─────────────────────────────────
     $self->_detect_fvg($run_data);
 
-    # ── Paso 5: Order Blocks (última vela opuesta antes de cada BOS) ────────
+    # ── Paso 5: Order Blocks (última vela opuesta antes de cada BOS externo) ─
     $self->_detect_order_blocks($run_data);
 
     # ── Paso 6: Support / Resistance (niveles con reacción repetida) ────────
     $self->_detect_support_resistance($run_data);
 
-    # ── Paso 7: Trendlines / Channels (líneas entre swings consecutivos) ────
+    # ── Paso 7: Trendlines / Channels — ahora sobre major_swings (estructura
+    #    externa), no sobre el set denso interno. Reduce ~10x el número de
+    #    líneas y las ancla a swings realmente significativos.
     $self->_detect_trendlines();
 
-    # ── Paso 7.5: Fibonacci Retracement levels ───────────────────────────────
+    # ── Paso 7.5: Fibonacci Retracement levels — también sobre major_swings,
+    #    mismo criterio que Trendlines (mismo tipo de ruido, misma solución).
     $self->_detect_fibonacci();
 
     # ── Paso 8: proximidad a la vela diaria más reciente ─────────────────────
@@ -479,6 +546,7 @@ sub _trim_warmup {
     $self->_offset_indices(-$warmup_n);
 
     @{ $self->{swings} }             = grep { $_->{index} >= 0 } @{ $self->{swings} };
+    @{ $self->{major_swings} }       = grep { $_->{index} >= 0 } @{ $self->{major_swings} };
     @{ $self->{events} }             = grep { $_->{index} >= 0 } @{ $self->{events} };
     @{ $self->{fvgs} }               = grep { $_->{index} >= 0 } @{ $self->{fvgs} };
     @{ $self->{order_blocks} }       = grep { $_->{index} >= 0 } @{ $self->{order_blocks} };
@@ -490,6 +558,9 @@ sub _trim_warmup {
     # (los que había armado _offset_indices arriba incluían lo descartado).
     $self->{swings_by_index} = {};
     $self->{swings_by_index}{ $_->{index} } = $_ for @{ $self->{swings} };
+
+    $self->{major_swings_by_index} = {};
+    $self->{major_swings_by_index}{ $_->{index} } = $_ for @{ $self->{major_swings} };
 
     $self->{events_by_index} = {};
     for my $ev (@{ $self->{events} }) {
@@ -542,25 +613,32 @@ sub _build_bucket_index {
 # ─────────────────────────────────────────────────────────────────────────────
 # _detect_bos_choch — Punto 3.2
 #
-# Recorre las velas cronológicamente. En cada vela comprueba si el CIERRE
+# Recorre las velas cronológicamente. En cada vela comprueba si el CUERPO
 # rompe el último Swing High o Swing Low relevante. La clasificación sigue
 # la relación estructural del PDF (sección 5):
 #
 #   BOS (Break of Structure)   — confirma la tendencia vigente:
-#     · Alcista: Close > último HH  (la estructura de máximos sigue creciendo)
-#     · Bajista: Close < último LL  (la estructura de mínimos sigue cayendo)
+#     · Alcista: cuerpo > último HH  (la estructura de máximos sigue creciendo)
+#     · Bajista: cuerpo < último LL  (la estructura de mínimos sigue cayendo)
 #
 #   CHoCH (Change of Character) — señala una reversión de tendencia:
-#     · Alcista a bajista: Close < último HL (rompe el último mínimo creciente)
-#     · Bajista a alcista: Close > último LH (rompe el último máximo decreciente)
+#     · Alcista a bajista: cuerpo < último HL (rompe el último mínimo creciente)
+#     · Bajista a alcista: cuerpo > último LH (rompe el último máximo decreciente)
 #
-#   scope 'internal' vs 'external':
-#     · internal: la ruptura solo supera el nivel del swing inmediatamente
-#       anterior del tipo relevante (estructura de corto plazo).
-#     · external: la ruptura además supera el swing ANTERIOR a ese — un nivel
-#       de mayor jerarquía estructural dentro del mismo timeframe activo.
-#       (La proyección desde TF superiores —HTF real— se añade en 3.4/3.5
-#        cuando el módulo de Liquidez aporte el contexto multi-temporal).
+# ── FIX (retroalimentación del profesor: "OB debe ser más externo",
+# "limpiar HH/HL/LH/LL", "corregir trendlines") ─────────────────────────────
+# ANTES: 'internal' y 'external' venían del MISMO set de swings k=5 — external
+# era literalmente "el swing anterior al más reciente" (un truco de desfase,
+# no una estructura distinta). Eso no reducía nada de ruido: verificado que
+# 419 de 905 Order Blocks salían de "external" con ese esquema, casi tan
+# denso como internal.
+#
+# AHORA: 'internal' y 'external' son dos DETECCIONES INDEPENDIENTES:
+#   · internal -> corre sobre {swings}       (k = depth,       ej. 5)
+#   · external -> corre sobre {major_swings} (k = major_depth, ej. 50)
+# Igual que LuxAlgo real (Internal Structure vs Swing Structure, dos pivotes
+# de longitud distinta — ver ScriptSMCSTRUCTURES.txt). Cada pasada mantiene
+# su propio pivote activo y su propia tendencia — no se mezclan entre sí.
 #
 # Una vez resuelto un evento, el nivel roto se considera "consumido" y no
 # vuelve a generar el mismo tipo de evento hasta que aparezca un nuevo swing
@@ -570,86 +648,46 @@ sub _build_bucket_index {
 sub _detect_bos_choch {
     my ($self, $data) = @_;
 
-    # ── Versión unificada (Fase 1 del plan) ─────────────────────────────────
-    #
-    # Se mantiene tal cual la base de swings (Fase A/B/C de calculate_all,
-    # zigzag con alternancia estricta sobre el fractal k del PDF 4.1) — no
-    # se toca nada de eso aquí.
-    #
-    # Se mantiene el criterio de "cuerpo rompe el nivel" (max(open,close) /
-    # min(open,close)) que se pidió explícitamente ("El BOS debe romper con
-    # el cuerpo") — NO se vuelve a close puro.
-    #
-    # Lo que se corrige respecto a la versión anterior:
-    #
-    #   1. CRUCE REAL: exige que el cuerpo de la vela ANTERIOR no rompiera
-    #      ya ese nivel. Sin esto, un pivot que aparece tarde (por el lag de
-    #      profundidad k) podía "romperse" en la primera vela evaluada aunque
-    #      el precio ya llevara tiempo por encima/debajo — generaba BOS en
-    #      lugares donde visualmente el precio "ya venía roto" desde antes.
-    #
-    #   2. DOS LENTES INDEPENDIENTES (internal / external): cada una con su
-    #      propio pivot activo y su propia bandera 'crossed' — una vez roto,
-    #      ese nivel nunca vuelve a generar evento hasta ser reemplazado por
-    #      un swing nuevo del mismo tipo. Antes 'consumed_high/low' se
-    #      indexaba por swing, pero external e internal compartían el mismo
-    #      trend, lo que podía clasificar mal un CHoCH/BOS cuando ambas
-    #      jerarquías estaban en momentos distintos de su ciclo.
-    #
-    #   3. TENDENCIA SEPARADA POR SCOPE: swingTrend/internalTrend equivalente
-    #      — igual que LuxAlgo, para que "internal" y "external" no se
-    #      contaminen entre sí al decidir BOS vs CHoCH.
-    #
-    # Contrato de salida sin cambios: cada evento sigue teniendo los campos
-    # {index, type, direction, scope, level_price, level_index} vía
-    # _push_event(), así que _detect_order_blocks(), el Overlay, y cualquier
-    # otro consumidor no requieren ningún cambio.
+    $self->_detect_bos_choch_pass($data, $self->{swings},       'internal');
+    $self->_detect_bos_choch_pass($data, $self->{major_swings}, 'external');
 
-    my @highs = grep { $_->{type} eq 'high' } @{ $self->{swings} };
-    my @lows  = grep { $_->{type} eq 'low'  } @{ $self->{swings} };
+    # Las dos pasadas se calcularon por separado (internal primero, external
+    # después) — reordenar cronológicamente y reconstruir events_by_index
+    # para que events_in_range() (búsqueda binaria) siga funcionando.
+    @{ $self->{events} } = sort { $a->{index} <=> $b->{index} } @{ $self->{events} };
+    $self->{events_by_index} = {};
+    for my $ev (@{ $self->{events} }) {
+        my $k = $ev->{index};
+        if (exists $self->{events_by_index}{$k}) {
+            my $e = $self->{events_by_index}{$k};
+            $self->{events_by_index}{$k} = ref($e) eq 'ARRAY' ? [@$e, $ev] : [$e, $ev];
+        } else { $self->{events_by_index}{$k} = $ev; }
+    }
+}
+
+# _detect_bos_choch_pass — UNA pasada de detección BOS/CHoCH sobre UN solo
+# set de swings ($swings_arr), con su propio pivote y tendencia (sin
+# lentes/desfases). Genera eventos con scope=$scope.
+sub _detect_bos_choch_pass {
+    my ($self, $data, $swings_arr, $scope) = @_;
+
+    my @highs = grep { $_->{type} eq 'high' } @$swings_arr;
+    my @lows  = grep { $_->{type} eq 'low'  } @$swings_arr;
 
     my $hi_ptr = 0;
     my $lo_ptr = 0;
-
-    # Pivot = { price, index, crossed }. Uno por lado (high/low) y por lente
-    # (internal/external). 'crossed' arranca en falso cada vez que el pivot
-    # se actualiza a un swing nuevo.
-    my %pivot = (
-        internal => { high => undef, low => undef },
-        external => { high => undef, low => undef },
-    );
-
-    # Tendencia SEPARADA por lente (equivalente a swingTrend / internalTrend)
-    my %trend = ( internal => 'unknown', external => 'unknown' );
-
-    # Cuerpo de la vela anterior, para exigir un cruce real (no solo "está
-    # por encima/debajo"). undef en i=0.
+    my ($ph, $pl);     # pivote activo high/low de ESTE scope únicamente
+    my $trend = 'unknown';
     my ($prev_body_high, $prev_body_low);
 
     for (my $i = 0; $i < scalar(@$data); $i++) {
 
-        # Avanzar punteros de swings hasta <= i. Cada nuevo swing high
-        # desplaza: external.high <- internal.high (el que antes era "el
-        # más reciente" pasa a ser "el anterior a ese"), e internal.high <-
-        # el nuevo swing. Ambos se reinician crossed=0.
         while ($hi_ptr <= $#highs && $highs[$hi_ptr]{index} <= $i) {
-            $pivot{external}{high} = $pivot{internal}{high};
-            $pivot{internal}{high} = {
-                price => $highs[$hi_ptr]{price},
-                index => $highs[$hi_ptr]{index},
-                crossed => 0,
-            };
-            $pivot{external}{high}{crossed} = 0 if $pivot{external}{high};
+            $ph = { price => $highs[$hi_ptr]{price}, index => $highs[$hi_ptr]{index}, crossed => 0 };
             $hi_ptr++;
         }
         while ($lo_ptr <= $#lows && $lows[$lo_ptr]{index} <= $i) {
-            $pivot{external}{low} = $pivot{internal}{low};
-            $pivot{internal}{low} = {
-                price => $lows[$lo_ptr]{price},
-                index => $lows[$lo_ptr]{index},
-                crossed => 0,
-            };
-            $pivot{external}{low}{crossed} = 0 if $pivot{external}{low};
+            $pl = { price => $lows[$lo_ptr]{price}, index => $lows[$lo_ptr]{index}, crossed => 0 };
             $lo_ptr++;
         }
 
@@ -660,35 +698,28 @@ sub _detect_bos_choch {
         my $body_low  = $data->[$i]{close} < $data->[$i]{open}
                       ? $data->[$i]{close} : $data->[$i]{open};
 
-        for my $scope (qw(internal external)) {
-            my $ph = $pivot{$scope}{high};
-            my $pl = $pivot{$scope}{low};
+        # Cruce alcista real: el cuerpo anterior NO rompía el nivel, el
+        # cuerpo actual sí (evita "romper" un nivel que ya venía roto).
+        my $crossed_up = defined($ph) && !$ph->{crossed}
+            && (!defined($prev_body_high) || $prev_body_high <= $ph->{price})
+            && $body_high > $ph->{price};
 
-            # Cruce alcista real: el cuerpo anterior NO rompía el nivel,
-            # el cuerpo actual sí.
-            my $crossed_up = defined($ph) && !$ph->{crossed}
-                && (!defined($prev_body_high) || $prev_body_high <= $ph->{price})
-                && $body_high > $ph->{price};
+        my $crossed_down = defined($pl) && !$pl->{crossed}
+            && (!defined($prev_body_low) || $prev_body_low >= $pl->{price})
+            && $body_low < $pl->{price};
 
-            my $crossed_down = defined($pl) && !$pl->{crossed}
-                && (!defined($prev_body_low) || $prev_body_low >= $pl->{price})
-                && $body_low < $pl->{price};
+        if ($crossed_up) {
+            my $tag = ($trend eq 'down') ? 'CHoCH' : 'BOS';
+            $self->_push_event($i, $tag, 'up', $scope, $ph->{price}, $ph->{index});
+            $ph->{crossed} = 1;
+            $trend = 'up';
+        }
 
-            if ($crossed_up) {
-                my $tag = ($trend{$scope} eq 'down') ? 'CHoCH' : 'BOS';
-                $self->_push_event($i, $tag, 'up', $scope,
-                    $ph->{price}, $ph->{index});
-                $ph->{crossed} = 1;
-                $trend{$scope} = 'up';
-            }
-
-            if ($crossed_down) {
-                my $tag = ($trend{$scope} eq 'up') ? 'CHoCH' : 'BOS';
-                $self->_push_event($i, $tag, 'down', $scope,
-                    $pl->{price}, $pl->{index});
-                $pl->{crossed} = 1;
-                $trend{$scope} = 'down';
-            }
+        if ($crossed_down) {
+            my $tag = ($trend eq 'up') ? 'CHoCH' : 'BOS';
+            $self->_push_event($i, $tag, 'down', $scope, $pl->{price}, $pl->{index});
+            $pl->{crossed} = 1;
+            $trend = 'down';
         }
 
         $prev_body_high = $body_high;
@@ -904,11 +935,18 @@ sub _detect_support_resistance {
 # ─────────────────────────────────────────────────────────────────────────────
 # _detect_trendlines — "Trendlines/Channels: below or above" (cronograma 29/06)
 #
-# Conecta SWINGS CONSECUTIVOS del mismo tipo con una línea recta:
-#   - Línea de resistencia: conecta cada par de Swing Highs consecutivos
-#     (la línea queda "arriba" del precio — channel superior).
-#   - Línea de soporte: conecta cada par de Swing Lows consecutivos
-#     (la línea queda "abajo" del precio — channel inferior).
+# Conecta SWINGS MAYORES (major_swings, estructura externa) CONSECUTIVOS del
+# mismo tipo con una línea recta:
+#   - Línea de resistencia: conecta cada par de Swing Highs mayores consecutivos.
+#   - Línea de soporte: conecta cada par de Swing Lows mayores consecutivos.
+#
+# ── FIX (retroalimentación del profesor: "corregir trendlines porque no
+# coincide") ─────────────────────────────────────────────────────────────
+# Antes se usaba {swings} (interno, k=5) — con 2,581 swings en el histórico
+# de prueba, salían 2,579 trendlines: una maraña ilegible que no representa
+# ninguna estructura real (confirmado visualmente). Ahora usa {major_swings}
+# (k=50) — reduce a ~10% el número de líneas y las ancla a extremos
+# realmente significativos, no a cualquier zigzag menor.
 #
 # Cada trendline se expresa como y = slope*x + intercept (en términos de
 # índice de vela como x y precio como y) para que el Overlay pueda
@@ -918,7 +956,7 @@ sub _detect_trendlines {
     my ($self) = @_;
 
     for my $type ('high', 'low') {
-        my @pivots = grep { $_->{type} eq $type } @{ $self->{swings} };
+        my @pivots = grep { $_->{type} eq $type } @{ $self->{major_swings} };
         next if @pivots < 2;
 
         for (my $i = 0; $i < $#pivots; $i++) {
@@ -949,10 +987,11 @@ sub _detect_trendlines {
 # El PDF no fija una regla de anclaje específica para Fibonacci (a diferencia
 # de BOS/CHoCH/EQH-EQL, que sí tienen fórmulas explícitas en 4.1/4.2). Se usa
 # la convención estándar de la industria: anclar cada pierna a dos swings
-# CONSECUTIVOS de la secuencia ya alternada (misma fuente que Trendlines,
-# swings[i] -> swings[i+1]), generando una serie histórica de piernas — igual
-# patrón que _detect_trendlines, para que el Overlay pueda mostrar la más
-# reciente o cualquiera que intersecte el rango visible.
+# MAYORES consecutivos de la secuencia ya alternada (misma fuente que
+# Trendlines, major_swings[i] -> major_swings[i+1] — mismo fix de ruido que
+# ahí, ver comentario de _detect_trendlines), generando una serie histórica
+# de piernas para que el Overlay pueda mostrar la más reciente o cualquiera
+# que intersecte el rango visible.
 #
 # Convención: ratio=0 en el extremo MÁS RECIENTE (to) y ratio=1 en el
 # extremo anterior (from) — así "38.2%", "61.8%", etc. representan el
@@ -963,7 +1002,7 @@ my @FIB_RATIOS = (0, 0.236, 0.382, 0.5, 0.618, 0.786, 1);
 
 sub _detect_fibonacci {
     my ($self) = @_;
-    my $swings = $self->{swings};
+    my $swings = $self->{major_swings};
     return if @$swings < 2;
 
     for (my $i = 0; $i < $#$swings; $i++) {
@@ -1163,6 +1202,18 @@ sub _bsearch_hi {
 sub swings_in_range {
     my ($self, $start, $end) = @_;
     my $arr = $self->{swings};
+    return [] unless @$arr;
+    my $lo = _bsearch_lo($arr, $start);
+    my $hi = _bsearch_hi($arr, $end);
+    return [] if $hi < $lo;
+    return [ @{$arr}[$lo .. $hi] ];
+}
+
+# Equivalente a swings_in_range pero para la estructura EXTERNA (major_swings).
+# Es lo que usa el Overlay para dibujar las etiquetas HH/HL/LH/LL "limpias".
+sub major_swings_in_range {
+    my ($self, $start, $end) = @_;
+    my $arr = $self->{major_swings};
     return [] unless @$arr;
     my $lo = _bsearch_lo($arr, $start);
     my $hi = _bsearch_hi($arr, $end);
