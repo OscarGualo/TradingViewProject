@@ -511,16 +511,27 @@ sub _draw_support_resistance {
 # ─────────────────────────────────────────────────────────────────────────────
 # _draw_trendlines — "Trendlines/Channels: below or above" (cronograma 29/06)
 #
-# Cada trendline conecta dos swings consecutivos del mismo tipo. Se dibuja el
-# segmento y se EXTIENDE hacia adelante usando slope/intercept hasta el borde
-# visible. Resistencia (highs) = rojo; Soporte (lows) = verde.
+# Cada trendline conecta dos swings mayores consecutivos del mismo tipo. Se
+# dibuja el segmento y se EXTIENDE hacia adelante usando slope/intercept
+# hasta el borde visible. Resistencia (highs) = rojo; Soporte (lows) = verde.
+#
+# ── FIX (retroalimentación del profesor: "corregir trendlines porque no
+# coincide") ─────────────────────────────────────────────────────────────
+# Antes se usaba trendlines_in_range($start,$end): con zoom muy alejado en
+# 1m (miles de velas visibles), docenas de canales HISTÓRICOS distintos
+# intersectan ese rango tan ancho, y cada uno se extiende hasta el borde
+# derecho -> maraña de líneas cruzadas (confirmado con capturas). Ahora se
+# usa latest_trendlines_before($end, 2): solo los 2 canales MÁS RECIENTES
+# por tipo (resistencia/soporte) hasta el cursor, sin importar el zoom —
+# como una herramienta de canal real, no "todo lo que cabe en pantalla".
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_trendlines {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
-    for my $tl (@{ $smc->trendlines_in_range($start, $end) }) {
+    for my $tl (@{ $smc->latest_trendlines_before($end, 2) }) {
         my $i1 = $tl->{point1}{index};
         my $i2 = $end;                       # extender el canal hacia adelante
+        next if $i1 > $end;                  # canal fuera de rango (no debería pasar)
         $i1 = $start if $i1 < $start;
 
         my $p1 = $tl->{slope} * $i1 + $tl->{intercept};

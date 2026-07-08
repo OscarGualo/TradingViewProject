@@ -1342,6 +1342,37 @@ sub trendlines_in_range {
     return [ grep { $_->{point2}{index} >= $start } @{$arr}[0 .. $lo2] ];
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# latest_trendlines_before — FIX (retroalimentación del profesor: "corregir
+# trendlines porque no coincide"). trendlines_in_range() devuelve TODO lo que
+# geométricamente intersecta [start,end] — con zoom muy alejado (miles de
+# velas en 1m), eso incluye docenas de canales históricos distintos, cada
+# uno extendido hasta el borde derecho: el resultado es la maraña de líneas
+# reportada (confirmado con capturas: ~60-100 líneas cruzadas en 1m).
+#
+# La solución no es filtrar por geometría sino por VIGENCIA: como un canal
+# de TradingView, solo interesan los $n canales MÁS RECIENTES de cada tipo
+# (resistencia/soporte) hasta el cursor/borde derecho $end — sin importar
+# cuánta historia haya en pantalla. Reduce a un puñado de líneas siempre,
+# sea cual sea el nivel de zoom.
+# ─────────────────────────────────────────────────────────────────────────────
+sub latest_trendlines_before {
+    my ($self, $end, $n) = @_;
+    $n //= 2;
+    my (%by_kind);
+    for my $tl (@{ $self->{trendlines} }) {
+        next if $tl->{point2}{index} > $end;
+        push @{ $by_kind{ $tl->{kind} } }, $tl;
+    }
+    my @result;
+    for my $kind (keys %by_kind) {
+        my @sorted = sort { $a->{point2}{index} <=> $b->{point2}{index} } @{ $by_kind{$kind} };
+        my $from = @sorted > $n ? (@sorted - $n) : 0;
+        push @result, @sorted[$from .. $#sorted];
+    }
+    return \@result;
+}
+
 # Fibonacci: mismo patron que trendlines_in_range -- ordenado cronologicamente
 # por construccion (se generan en el mismo orden que swings), asi que basta
 # con filtrar por interseccion de [from.index, to.index] con [start,end].
