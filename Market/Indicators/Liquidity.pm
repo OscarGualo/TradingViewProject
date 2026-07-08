@@ -205,10 +205,6 @@ sub calculate_all {
     $self->_classify_origin();
 }
 # ─────────────────────────────────────────────────────────────────────────────
-# calculate_replay — versión para el sistema Replay (ver comentario detallado
-# más abajo, junto a la implementación, sobre el fix de EQH/EQL).
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
 # calculate_replay — versión para el sistema Replay
 #
 # ── FIX (bug reportado): antes esta función usaba _detect_levels_fast(),
@@ -225,6 +221,16 @@ sub calculate_all {
 # a las últimas REPLAY_WINDOW (~4000) velas, correr la detección completa
 # de EQH/EQL en cada step es barato. Se usa _detect_levels() (completo)
 # en vez de _detect_levels_fast().
+#
+# ── FIX (hallazgo 4a): warm-up de contexto ──────────────────────────────
+# Igual problema que en SMC_Structures: sin contexto previo, los niveles
+# formados justo ANTES del borde de la ventana no existen, así que un
+# Sweep/Grab/Run que en realidad depende de un BSL/SSL/EQH/EQL formado un
+# poco antes del cursor-4000 no se detecta cerca de ese borde, y el
+# emparejamiento EQH/EQL (que mira hasta 12 swings atrás) pierde pares
+# reales que caen justo en el límite. Se aplica el mismo patrón que
+# SMC_Structures::calculate_all(): calcular sobre warmup+ventana y recortar
+# al final con _trim_warmup().
 # ─────────────────────────────────────────────────────────────────────────────
 sub calculate_replay {
     my ($self, $market_data) = @_;
@@ -236,18 +242,61 @@ sub calculate_replay {
 
     $self->{_detection_tf} = $market_data->get_timeframe();
 
-    $self->_calc_swings($data);
-    my $atr = $self->_calc_atr($data);
-
-    # BSL, SSL, EQH y EQL — completo, ya no hace falta la versión "fast".
-    $self->_detect_levels($data, $atr);
-    $self->_run_state_machine($data);
-    # Omitimos _calc_mtf_volume (no afecta el render del Replay)
-
-    # Windowing (Market::WindowProxy): índices locales -> globales.
     my $base = (ref($market_data) && $market_data->can('base_index'))
              ? $market_data->base_index : 0;
+    my $warmup_n = 0;
+    my $run_data = $data;
+    if ($base > 0 && $market_data->can('get_warmup_slice')) {
+        my $WARMUP = $self->{warmup_candles} // 500;
+        my $wu = $market_data->get_warmup_slice($WARMUP);
+        if ($wu && @$wu) {
+            $warmup_n = scalar @$wu;
+            $run_data = [ @$wu, @$data ];
+        }
+    }
+
+    $self->_calc_swings($run_data);
+    my $atr = $self->_calc_atr($run_data);
+
+    # BSL, SSL, EQH y EQL — completo, ya no hace falta la versión "fast".
+    $self->_detect_levels($run_data, $atr);
+    $self->_run_state_machine($run_data);
+    # Omitimos _calc_mtf_volume (no afecta el render del Replay)
+
+    # Recortar el warm-up: descartar niveles detectados enteramente antes
+    # de la ventana real y reindexar de vuelta al espacio local de la
+    # ventana (mismo patrón que SMC_Structures::_trim_warmup).
+    $self->_trim_warmup($warmup_n) if $warmup_n;
+
+    # Windowing (Market::WindowProxy): índices locales -> globales.
     $self->_offset_indices($base) if $base;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _trim_warmup — ver comentario detallado en SMC_Structures_indicators.pm
+# (mismo patrón: descarta lo detectado enteramente en el warm-up, reindexa
+# lo demás restando $warmup_n para volver al espacio local de la ventana).
+# Los índices de REFERENCIA (pair_index, swept_at, resolved_at) que queden
+# negativos se dejan tal cual: el _offset_indices($base) posterior los
+# resuelve a índices GLOBALES reales, apuntando a historial válido fuera
+# de la ventana actual.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _trim_warmup {
+    my ($self, $warmup_n) = @_;
+    return unless $warmup_n;
+
+    $self->_offset_indices(-$warmup_n);
+
+    @{ $self->{levels} } = grep { $_->{index} >= 0 } @{ $self->{levels} };
+
+    $self->{levels_by_index} = {};
+    for my $lv (@{ $self->{levels} }) {
+        my $idx = $lv->{index};
+        if (exists $self->{levels_by_index}{$idx}) {
+            my $e = $self->{levels_by_index}{$idx};
+            $self->{levels_by_index}{$idx} = ref($e) eq 'ARRAY' ? [@$e, $lv] : [$e, $lv];
+        } else { $self->{levels_by_index}{$idx} = $lv; }
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

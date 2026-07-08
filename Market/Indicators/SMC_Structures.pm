@@ -297,9 +297,42 @@ sub calculate_all {
 
     return if $n < (2 * $k + 1);   # no hay suficientes velas para un swing
 
+    # ── FIX (hallazgo 4a): warm-up de contexto para WindowProxy ─────────────
+    #
+    # Cuando $market_data es un WindowProxy (Replay), $data solo contiene la
+    # ventana visible (ej. últimas 4000 velas). Antes, TODO el cálculo corría
+    # exclusivamente sobre esa ventana, así que el estado de tendencia
+    # ($last_high/$last_low en Fase C, y $trend{internal/external} en
+    # _detect_bos_choch) se REINICIABA en cada llamada — el primer swing high
+    # de la ventana siempre salía 'HH', el primer low siempre 'LL', y el
+    # primer BOS/CHoCH del borde de la ventana siempre se clasificaba como
+    # BOS (trend='unknown'), sin importar el contexto real anterior.
+    #
+    # Fix: si hay base_index() > 0 (estamos en una ventana), pedimos velas
+    # de warm-up ANTES del inicio de la ventana (mismo patrón que ya usa
+    # ZigZagMTF::calculate_all) y corremos TODO el cálculo sobre el array
+    # combinado (warmup + ventana). Al final, _trim_warmup() descarta lo que
+    # ocurrió enteramente en el warm-up y reindexa lo demás de vuelta al
+    # espacio local de la ventana — el resultado final tiene exactamente el
+    # mismo "shape" que antes, pero con la clasificación de tendencia correcta
+    # heredada del historial real, no reiniciada en el borde de la ventana.
+    my $base = (ref($market_data) && $market_data->can('base_index'))
+             ? $market_data->base_index : 0;
+    my $warmup_n = 0;
+    my $run_data = $data;
+    if ($base > 0 && $market_data->can('get_warmup_slice')) {
+        my $WARMUP = $self->{warmup_candles} // 500;
+        my $wu = $market_data->get_warmup_slice($WARMUP);
+        if ($wu && @$wu) {
+            $warmup_n = scalar @$wu;
+            $run_data = [ @$wu, @$data ];
+        }
+    }
+    my $rn = scalar @$run_data;
+
     # ── Paso 1 + 2: Swing Points con alternancia forzada (estilo LuxAlgo) ──────
     #
-    # Algoritmo en dos fases:
+    # Algoritmo en dos fases (corre sobre $run_data = warmup + ventana):
     #   A) Candidatos: velas que son extremo local dentro de la ventana ±k.
     #   B) Zigzag con alternancia estricta: en rachas del mismo tipo (high/high
     #      o low/low) conservar solo el extremo más pronunciado. Esto produce
@@ -310,12 +343,12 @@ sub calculate_all {
 
     # Fase A: candidatos extremo local
     my @cand;
-    for (my $i = $k; $i <= $n - 1 - $k; $i++) {
-        my $c = $data->[$i];
+    for (my $i = $k; $i <= $rn - 1 - $k; $i++) {
+        my $c = $run_data->[$i];
 
         my $is_high = 1;
         for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
-            if ($data->[$j]{high} >= $c->{high}) { $is_high = 0; last; }
+            if ($run_data->[$j]{high} >= $c->{high}) { $is_high = 0; last; }
         }
         if ($is_high) {
             push @cand, { index => $i, price => $c->{high}, type => 'high' };
@@ -324,7 +357,7 @@ sub calculate_all {
 
         my $is_low = 1;
         for my $j (($i - $k) .. ($i - 1), ($i + 1) .. ($i + $k)) {
-            if ($data->[$j]{low} <= $c->{low}) { $is_low = 0; last; }
+            if ($run_data->[$j]{low} <= $c->{low}) { $is_low = 0; last; }
         }
         if ($is_low) {
             push @cand, { index => $i, price => $c->{low}, type => 'low' };
@@ -351,7 +384,10 @@ sub calculate_all {
     }
 
     # Fase C: etiquetar HH/HL/LH/LL comparando cada swing con el anterior
-    # del mismo tipo (igual que antes pero ahora la serie ya está alternada)
+    # del mismo tipo (igual que antes pero ahora la serie ya está alternada).
+    # Con warm-up, los primeros swings de esta secuencia caen DENTRO del
+    # warm-up, así que cuando lleguemos al primer swing DENTRO de la ventana
+    # real, $last_high/$last_low ya traen el contexto correcto.
     my $last_high;
     my $last_low;
 
@@ -379,17 +415,18 @@ sub calculate_all {
         $self->{swings_by_index}{ $sw->{index} } = $entry;
     }
 
-    # ── Paso 3: detección de BOS y CHoCH ─────────────────────────────────────
-    $self->_detect_bos_choch($data);
+    # ── Paso 3: detección de BOS y CHoCH (sobre $run_data: el estado de
+    #    tendencia interno/externo también hereda contexto del warm-up) ──────
+    $self->_detect_bos_choch($run_data);
 
     # ── Paso 4: detección de Fair Value Gaps ─────────────────────────────────
-    $self->_detect_fvg($data);
+    $self->_detect_fvg($run_data);
 
     # ── Paso 5: Order Blocks (última vela opuesta antes de cada BOS) ────────
-    $self->_detect_order_blocks($data);
+    $self->_detect_order_blocks($run_data);
 
     # ── Paso 6: Support / Resistance (niveles con reacción repetida) ────────
-    $self->_detect_support_resistance($data);
+    $self->_detect_support_resistance($run_data);
 
     # ── Paso 7: Trendlines / Channels (líneas entre swings consecutivos) ────
     $self->_detect_trendlines();
@@ -398,7 +435,15 @@ sub calculate_all {
     $self->_detect_fibonacci();
 
     # ── Paso 8: proximidad a la vela diaria más reciente ─────────────────────
+    # Usa $data (la ventana real, no $run_data) — "vela actual" siempre debe
+    # ser la última visible, que es la misma en ambos arrays de todos modos.
     $self->_calc_daily_proximity($market_data, $data);
+
+    # ── Recortar el warm-up: descartar lo que ocurrió enteramente antes de
+    #    la ventana real y reindexar de vuelta al espacio LOCAL de la
+    #    ventana (mismo espacio que tenían los índices al calcular
+    #    directamente sobre $data, antes de este fix).
+    $self->_trim_warmup($warmup_n) if $warmup_n;
 
     # Ordenar trendlines por point1.index para habilitar búsqueda binaria
     @{ $self->{trendlines} } = sort { $a->{point1}{index} <=> $b->{point1}{index} }
@@ -408,9 +453,58 @@ sub calculate_all {
     $self->_build_bucket_index();
 
     # Windowing (Market::WindowProxy): convertir índices locales -> globales.
-    my $base = (ref($market_data) && $market_data->can('base_index'))
-             ? $market_data->base_index : 0;
     $self->_offset_indices($base) if $base;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _trim_warmup — descarta las entradas cuyo evento "ocurrió" enteramente
+# dentro del warm-up (antes del inicio real de la ventana) y reindexa todo
+# lo demás restando $warmup_n, para volver al espacio de índices LOCAL de
+# la ventana (el mismo que tenían antes de este fix, cuando se calculaba
+# directo sobre $data sin warm-up).
+#
+# Reutiliza _offset_indices() para el desplazamiento (funciona con números
+# negativos igual que con positivos) y luego filtra por el campo "índice
+# primario" de cada colección. Los índices de REFERENCIA que queden
+# negativos tras el desplazamiento (ej. el level_index de un BOS cuyo pivote
+# roto vive en el warm-up, o un touch de Support/Resistance anterior a la
+# ventana) se dejan tal cual a propósito: el _offset_indices($base) final
+# del llamador los vuelve a convertir en índices GLOBALES reales y válidos
+# (apuntan a velas de historial real, solo que fuera de la ventana actual).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _trim_warmup {
+    my ($self, $warmup_n) = @_;
+    return unless $warmup_n;
+
+    $self->_offset_indices(-$warmup_n);
+
+    @{ $self->{swings} }             = grep { $_->{index} >= 0 } @{ $self->{swings} };
+    @{ $self->{events} }             = grep { $_->{index} >= 0 } @{ $self->{events} };
+    @{ $self->{fvgs} }               = grep { $_->{index} >= 0 } @{ $self->{fvgs} };
+    @{ $self->{order_blocks} }       = grep { $_->{index} >= 0 } @{ $self->{order_blocks} };
+    @{ $self->{support_resistance} } = grep { $_->{last_index} >= 0 } @{ $self->{support_resistance} };
+    @{ $self->{trendlines} }         = grep { $_->{point2}{index} >= 0 } @{ $self->{trendlines} };
+    @{ $self->{fibonacci} }          = grep { $_->{to}{index} >= 0 } @{ $self->{fibonacci} };
+
+    # Reconstruir los índices O(1) por vela con los arrays ya filtrados
+    # (los que había armado _offset_indices arriba incluían lo descartado).
+    $self->{swings_by_index} = {};
+    $self->{swings_by_index}{ $_->{index} } = $_ for @{ $self->{swings} };
+
+    $self->{events_by_index} = {};
+    for my $ev (@{ $self->{events} }) {
+        my $idx = $ev->{index};
+        if (exists $self->{events_by_index}{$idx}) {
+            my $e = $self->{events_by_index}{$idx};
+            $self->{events_by_index}{$idx} = ref($e) eq 'ARRAY' ? [@$e, $ev] : [$e, $ev];
+        } else { $self->{events_by_index}{$idx} = $ev; }
+    }
+
+    $self->{fvgs_by_index} = {};
+    $self->{fvgs_by_index}{ $_->{index} } = $_ for @{ $self->{fvgs} };
+
+    $self->{order_blocks_by_index} = {};
+    $self->{order_blocks_by_index}{ $_->{index} } = $_ for @{ $self->{order_blocks} };
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -678,6 +772,17 @@ sub _detect_fvg {
 #
 # Solo se generan Order Blocks a partir de eventos BOS (no CHoCH), ya que
 # el OB representa el origen de una continuación de tendencia confirmada.
+#
+# ── FIX (retroalimentación del profesor): "OB tiene que ser más externo,
+# no tanto interno... los externos hay que plotear, los internos no porque
+# se vería muy ruidoso." ──────────────────────────────────────────────────
+# Antes se generaba un OB por CADA BOS, sin importar su scope (internal o
+# external) — verificado empíricamente: de 905 Order Blocks totales, 486
+# venían de BOS internos y 419 de externos, es decir, más de la mitad del
+# ruido visual de OB era estructura interna que el profesor pidió ocultar.
+# Ahora solo se generan Order Blocks desde eventos BOS de scope 'external'
+# (estructura mayor) — la estructura interna deja de producir OB en
+# absoluto, tal como se pidió.
 # ─────────────────────────────────────────────────────────────────────────────
 sub _detect_order_blocks {
     my ($self, $data) = @_;
@@ -685,6 +790,7 @@ sub _detect_order_blocks {
 
     for my $ev (@{ $self->{events} }) {
         next unless $ev->{type} eq 'BOS';
+        next unless $ev->{scope} eq 'external';   # FIX: solo estructura externa
 
         my $is_bullish_bos = ($ev->{direction} eq 'up');
         my $search_start    = $ev->{level_index};
@@ -729,6 +835,7 @@ sub _detect_order_blocks {
         $self->{order_blocks_by_index}{$ob_index} = $ob;
     }
 }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _detect_support_resistance — "Support/Resistence: below support or above
