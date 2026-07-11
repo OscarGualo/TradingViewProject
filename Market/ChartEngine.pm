@@ -1021,6 +1021,17 @@ sub set_timeframe {
     $self->{market}->set_timeframe($tf);
     $self->{indicators}->reset_all();
 
+    # ── FIX (incrementalidad de FVG): invalidar el caché persistente de
+    # FVG explícitamente al cambiar de TF. _sync_fvg() mantiene su estado
+    # en índices GLOBALES entre llamadas para no recalcular todo el
+    # historial en cada paso — pero el índice 500 en 1m no es la misma
+    # vela que el índice 500 en 15m, así que la heurística automática de
+    # "el cursor avanzó" no es fiable ante un cambio de TF. Forzar un
+    # recálculo completo aquí (una sola vez, no en cada step) evita
+    # mezclar FVGs de una TF con velas de otra.
+    my $smc_ind = $self->{indicators}->get_indicator('SMC_Structures');
+    $smc_ind->invalidate_fvg_cache() if defined $smc_ind;
+
     # ATR es causal (solo mira hacia atrás): recalcularlo sobre el market
     # completo NUNCA filtra futuro, se haga o no Replay, así que siempre se
     # recalcula igual que antes.

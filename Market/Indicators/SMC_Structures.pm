@@ -229,6 +229,28 @@ sub reset {
     $self->{trendlines} = [];
     $self->{daily_proximity} = undef;
     $self->{fibonacci} = [];
+    # NOTA: reset() NO toca _fvg_global / _fvg_last_global_index a propósito
+    # — ese es el estado persistente que hace posible la actualización
+    # incremental de FVG (spec del profesor: "no debe recalcular todo el
+    # historial... únicamente debe analizar la nueva vela cerrada"). reset()
+    # se llama en CADA calculate_all() (todos los demás indicadores sí se
+    # recalculan siempre desde cero), así que si _fvg_global se limpiara
+    # aquí, la incrementalidad de FVG quedaría anulada en la práctica.
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# invalidate_fvg_cache — fuerza un recálculo COMPLETO de FVG en la próxima
+# llamada a calculate_all(). Necesario en los momentos donde el "índice
+# global" deja de tener el mismo significado (cambio de temporalidad: el
+# índice 500 en 1m no es la misma vela que el índice 500 en 15m), donde la
+# heurística automática de _sync_fvg() (comparar contra el último índice
+# procesado) no es fiable. Debe llamarse explícitamente desde ChartEngine
+# justo después de cambiar de TF.
+# ─────────────────────────────────────────────────────────────────────────────
+sub invalidate_fvg_cache {
+    my ($self) = @_;
+    $self->{_fvg_global} = [];
+    $self->{_fvg_last_global_index} = undef;
 }
 
 # values() devuelve el arrayref de swings — es el contrato esperado por
@@ -483,8 +505,10 @@ sub calculate_all {
     #    dos pasadas independientes, cada una con su propio pivote/tendencia.
     $self->_detect_bos_choch($run_data);
 
-    # ── Paso 4: detección de Fair Value Gaps ─────────────────────────────────
-    $self->_detect_fvg($run_data);
+    # ── Paso 4: Fair Value Gaps — INCREMENTAL (spec del profesor: "no debe
+    #    recalcular todo el historial... únicamente debe analizar la nueva
+    #    vela cerrada"). Ver _sync_fvg() para el detalle del mecanismo.
+    $self->_sync_fvg($market_data, $run_data, $warmup_n, $base);
 
     # ── Paso 5: Order Blocks (última vela opuesta antes de cada BOS externo) ─
     $self->_detect_order_blocks($run_data);
@@ -728,58 +752,314 @@ sub _detect_bos_choch_pass {
 }
 
 
-sub _detect_fvg {
-    my ($self, $data) = @_;
-    my $n = scalar @$data;
+# ─────────────────────────────────────────────────────────────────────────────
+# FVG (Fair Value Gap) — sistema completo
+#
+# Patrón estándar ICT/TradingView de 3 velas: un FVG alcista existe cuando
+# High[2] < Low[0] (usando la convención índice-0=vela más nueva del spec
+# del profesor), o en términos de este código: el máximo de la vela más
+# antigua del trío ($prev) es menor que el mínimo de la más nueva ($next).
+# Bajista: análogo invertido. La detección SOLO puede confirmarse cuando
+# la tercera vela del trío ya cerró — en este motor eso ya está garantizado
+# porque el array de velas de la TF activa nunca contiene una vela en
+# formación (ver ChartEngine::_replay_limit / MarketData::build_tf_candles).
+#
+# ── Cada FVG es un objeto independiente (spec del profesor) ────────────────
+# Campos: direction, top/bottom (límites VIGENTES, pueden recortarse por
+# mitigación parcial), orig_top/orig_bottom (límites originales de
+# formación), state ('active'|'mitigated', explícito), created_at /
+# created_epoch (fecha real de la vela de origen), g_index (vela de origen,
+# en índice GLOBAL) y g_mitigated_at (vela donde se mitigó del todo, o
+# undef). Múltiples FVG conviven en @{ $self->{_fvg_global} } sin
+# interferirse entre sí — cada uno es un hashref independiente.
+#
+# ── Mitigación parcial vs completa (spec del profesor) ──────────────────────
+# _apply_fvg_mitigation() compara cada vela nueva contra la zona VIGENTE:
+#   - Sin solape: no pasa nada.
+#   - Cobertura total en una vela: mitigación completa (state='mitigated').
+#   - Invade solo un borde: ese borde se recorta, el FVG sigue 'active' y
+#     más chico (igual que el indicador nativo de TradingView) — solo pasa
+#     a 'mitigated' cuando el remanente se consume por completo.
+#   - Toque aislado sin romper ningún borde (gap directo al centro, caso
+#     raro): se ignora, no hay borde no-ambiguo que recortar.
+#
+# ── Incrementalidad (spec del profesor: "no debe recalcular todo el
+# historial... únicamente debe analizar la nueva vela cerrada") ────────────
+# _sync_fvg() es el único punto de entrada, llamado desde calculate_all()
+# en cada paso (incluido cada step de Replay). Mantiene el estado en
+# $self->{_fvg_global}, indexado en términos GLOBALES (no se ve afectado
+# por el desplazamiento de la ventana de WindowProxy) y persistente entre
+# llamadas — reset() NO lo toca a propósito (ver comentario en reset()).
+#
+#   - Si el cursor avanzó desde la última llamada (caso normal de Replay:
+#     step, play, fast-forward): SOLO se procesan las velas nuevas —
+#     _fvg_incremental_scan() revisa mitigación de los FVG activos
+#     existentes contra las velas nuevas, y busca FVG nuevos únicamente en
+#     los tríos cuyo centro cae en el tramo recién cerrado. Costo O(velas
+#     nuevas + FVG activos), NO O(todo el historial).
+#   - Si el cursor retrocedió (replay rebobinado) o no hay estado previo
+#     (primera vez, o justo después de invalidate_fvg_cache()): se hace un
+#     _fvg_full_scan() del array disponible — el mismo costo que antes,
+#     pero solo en este caso excepcional, no en cada step.
+#   - invalidate_fvg_cache() se llama explícitamente desde ChartEngine al
+#     cambiar de temporalidad, porque ahí el "índice global" dejaría de
+#     significar la misma vela y la heurística de avance no es fiable.
+#
+# Al final, _sync_fvg() publica el resultado en el formato LOCAL clásico
+# ($self->{fvgs}, $self->{fvgs_by_index}) para que el resto del pipeline
+# (bucket index, _offset_indices($base) final de calculate_all, overlay)
+# no necesite saber nada de este mecanismo interno.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _sync_fvg {
+    my ($self, $market_data, $run_data, $warmup_n, $base) = @_;
+    my $rn = scalar @$run_data;
 
-    return if $n < 3;
+    $self->{fvgs} = [];
+    $self->{fvgs_by_index} = {};
+    return if $rn < 3;
 
-    for (my $i = 1; $i < $n - 1; $i++) {
-        my $prev = $data->[$i - 1];
-        my $next = $data->[$i + 1];
+    my $run_base_global = $base - $warmup_n;    # índice GLOBAL de run_data[0]
+    my $cur_global_last  = $run_base_global + $rn - 1;
+    my $prev_last        = $self->{_fvg_last_global_index};
 
-        my $fvg;
+    my $need_full_scan =
+           !defined($prev_last)
+        || $cur_global_last < $prev_last                 # replay rebobinado
+        || ($prev_last - $run_base_global) >= $rn;        # fuera del array actual (defensivo)
 
-        # FVG alcista: el mínimo de la vela siguiente queda por encima
-        # del máximo de la vela anterior — hueco sin solapamiento.
-        if ($next->{low} > $prev->{high}) {
-            $fvg = {
-                index        => $i,
-                direction    => 'up',
-                top          => $next->{low},
-                bottom       => $prev->{high},
-                mitigated_at => undef,
-            };
-        }
-        # FVG bajista: el máximo de la vela siguiente queda por debajo
-        # del mínimo de la vela anterior.
-        elsif ($next->{high} < $prev->{low}) {
-            $fvg = {
-                index        => $i,
-                direction    => 'down',
-                top          => $prev->{low},
-                bottom       => $next->{high},
-                mitigated_at => undef,
-            };
-        }
-
-        next unless defined $fvg;
-
-        # ── Búsqueda de mitigación ────────────────────────────────────────
-        # Recorre las velas posteriores a la formación (desde i+2, ya que
-        # i+1 es la vela que confirmó el gap y por definición no lo toca)
-        # buscando la primera que vuelve a entrar al rango [bottom, top].
-        for (my $j = $i + 2; $j < $n; $j++) {
-            my $c = $data->[$j];
-            if ($c->{low} <= $fvg->{top} && $c->{high} >= $fvg->{bottom}) {
-                $fvg->{mitigated_at} = $j;
-                last;
-            }
-        }
-
-        push @{ $self->{fvgs} }, $fvg;
-        $self->{fvgs_by_index}{$i} = $fvg;
+    if ($need_full_scan) {
+        $self->_fvg_full_scan($run_data, $run_base_global);
+    } else {
+        $self->_fvg_incremental_scan($run_data, $run_base_global, $prev_last, $cur_global_last);
     }
+    $self->{_fvg_last_global_index} = $cur_global_last;
+
+    # Publicar en espacio LOCAL de ventana (index = g_index - base), igual
+    # convención que _detect_fvg() producía antes de este cambio — el
+    # _offset_indices($base) final de calculate_all() se encarga de
+    # convertir a GLOBAL una sola vez, igual que para todos los demás tipos.
+    my $win_end_global = $base + ($rn - $warmup_n) - 1;   # = base + n - 1
+    for my $fvg (@{ $self->{_fvg_global} }) {
+        next if $fvg->{g_index} > $win_end_global;
+        next if $fvg->{g_index} < $base;   # nacido en warmup: fuera de la ventana publicada
+        my $local_index = $fvg->{g_index} - $base;
+        my $local = {
+            index        => $local_index,
+            direction    => $fvg->{direction},
+            top          => $fvg->{top},
+            bottom       => $fvg->{bottom},
+            orig_top     => $fvg->{orig_top},
+            orig_bottom  => $fvg->{orig_bottom},
+            state        => $fvg->{state},
+            created_at   => $fvg->{created_at},
+            created_epoch=> $fvg->{created_epoch},
+            mitigated_at => defined $fvg->{g_mitigated_at} ? ($fvg->{g_mitigated_at} - $base) : undef,
+        };
+        push @{ $self->{fvgs} }, $local;
+        $self->{fvgs_by_index}{$local_index} = $local;
+    }
+    @{ $self->{fvgs} } = sort { $a->{index} <=> $b->{index} } @{ $self->{fvgs} };
+}
+
+# _fvg_full_scan — recorre TODO $run_data (caso excepcional: primera vez,
+# replay rebobinado, o justo después de invalidate_fvg_cache()). Reconstruye
+# $self->{_fvg_global} desde cero, en índices GLOBALES.
+sub _fvg_full_scan {
+    my ($self, $run_data, $run_base_global) = @_;
+    $self->{_fvg_global} = [];
+
+    my $rn = scalar @$run_data;
+    return if $rn < 3;
+
+    my $atr_arr   = $self->_calc_atr_simple($run_data, 14);
+    my $min_ratio = $self->{fvg_min_atr_ratio} // 0.15;
+
+    for (my $i = 1; $i < $rn - 1; $i++) {
+        my $fvg = $self->_try_form_fvg($run_data, $i, $atr_arr, $min_ratio, $run_base_global);
+        next unless $fvg;
+        for (my $j = $i + 2; $j < $rn; $j++) {
+            last if $self->_apply_fvg_mitigation($fvg, $run_data->[$j], $j + $run_base_global);
+        }
+        push @{ $self->{_fvg_global} }, $fvg;
+    }
+}
+
+# _fvg_incremental_scan — SOLO procesa lo nuevo desde $prev_last_global:
+#   1) Mitigación de los FVG YA existentes (activos) contra las velas nuevas.
+#   2) Detección de FVG NUEVOS, cuyo centro cae en el tramo recién cerrado.
+# Nunca vuelve a tocar velas/FVGs anteriores a $prev_last_global.
+sub _fvg_incremental_scan {
+    my ($self, $run_data, $run_base_global, $prev_last_global, $cur_last_global) = @_;
+    my $rn = scalar @$run_data;
+
+    # 1) Actualizar mitigación de los FVG activos existentes.
+    my $new_start_local = ($prev_last_global + 1) - $run_base_global;
+    $new_start_local = 0 if $new_start_local < 0;
+
+    for my $fvg (@{ $self->{_fvg_global} }) {
+        next unless $fvg->{state} eq 'active';
+        for (my $k = $new_start_local; $k < $rn; $k++) {
+            my $g = $k + $run_base_global;
+            next if $g <= $prev_last_global;   # ya procesada en una llamada anterior
+            last if $self->_apply_fvg_mitigation($fvg, $run_data->[$k], $g);
+        }
+    }
+
+    # 2) Detectar FVG nuevos: el trío centrado en $g solo puede confirmarse
+    # cuando su tercera vela ($g+1) ya cerró. Los centros nuevos a revisar
+    # son los que antes no se podían confirmar (el anterior "cur_last") y
+    # ahora sí, hasta el nuevo penúltimo índice disponible.
+    my $atr_arr;   # perezoso: solo se calcula si aparece al menos un trío nuevo
+    my $min_ratio = $self->{fvg_min_atr_ratio} // 0.15;
+
+    for (my $g = $prev_last_global; $g <= $cur_last_global - 1; $g++) {
+        my $i = $g - $run_base_global;
+        next if $i < 1 || $i > $rn - 2;
+        $atr_arr //= $self->_calc_atr_simple($run_data, 14);
+        my $fvg = $self->_try_form_fvg($run_data, $i, $atr_arr, $min_ratio, $run_base_global);
+        next unless $fvg;
+        for (my $k = $i + 2; $k < $rn; $k++) {
+            last if $self->_apply_fvg_mitigation($fvg, $run_data->[$k], $k + $run_base_global);
+        }
+        push @{ $self->{_fvg_global} }, $fvg;
+    }
+}
+
+# _try_form_fvg — evalúa si el trío centrado en el índice LOCAL $i (dentro
+# de $run_data) forma un FVG válido (patrón de 3 velas + filtro de tamaño
+# mínimo por ATR). Devuelve el hashref del FVG (en términos GLOBALES vía
+# $run_base_global) o undef si no aplica.
+sub _try_form_fvg {
+    my ($self, $run_data, $i, $atr_arr, $min_ratio, $run_base_global) = @_;
+    my $prev = $run_data->[$i - 1];
+    my $next = $run_data->[$i + 1];
+    my $origin_candle = $run_data->[$i];
+
+    my $fvg;
+    if ($next->{low} > $prev->{high}) {
+        $fvg = {
+            g_index       => $i + $run_base_global,
+            direction     => 'up',
+            top           => $next->{low},
+            bottom        => $prev->{high},
+            orig_top      => $next->{low},
+            orig_bottom   => $prev->{high},
+            state         => 'active',
+            created_at    => $origin_candle->{time},
+            created_epoch => $origin_candle->{epoch},
+            g_mitigated_at=> undef,
+        };
+    } elsif ($next->{high} < $prev->{low}) {
+        $fvg = {
+            g_index       => $i + $run_base_global,
+            direction     => 'down',
+            top           => $prev->{low},
+            bottom        => $next->{high},
+            orig_top      => $prev->{low},
+            orig_bottom   => $next->{high},
+            state         => 'active',
+            created_at    => $origin_candle->{time},
+            created_epoch => $origin_candle->{epoch},
+            g_mitigated_at=> undef,
+        };
+    }
+    return undef unless $fvg;
+
+    my $atr_here = $atr_arr->[$i];
+    if (defined $atr_here && $atr_here > 0) {
+        my $gap_size = $fvg->{top} - $fvg->{bottom};
+        return undef if $gap_size < ($min_ratio * $atr_here);
+    }
+    return $fvg;
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _apply_fvg_mitigation — spec del profesor: "Cuando el precio solo toque una
+# parte del FVG, este debe permanecer activo y continuar extendiéndose.
+# Cuando la zona sea completamente mitigada... el sistema debe permitir
+# configurar si el rectángulo desaparece o simplemente deja de extenderse."
+#
+# Compara la vela $c contra la zona VIGENTE del FVG ($fvg->{bottom}..{top},
+# que puede ya venir recortada de toques parciales previos) y decide:
+#
+#   - Sin solape -> no pasa nada, el FVG sigue igual.
+#   - La vela cubre TODA la zona vigente de una sola vez -> mitigación
+#     completa: state='mitigated', g_mitigated_at=$g.
+#   - La vela invade solo desde un borde (arriba o abajo) sin llegar al
+#     otro -> RECORTE: ese borde se mueve hasta donde llegó la vela, el
+#     FVG sigue 'active' con una zona más chica (igual que el indicador
+#     nativo de FVG de TradingView).
+#   - La vela queda enteramente DENTRO de la zona sin tocar ningún borde
+#     (gap directo al medio, caso raro) -> se ignora; no hay borde que
+#     recortar de forma no ambigua.
+#
+# $g es el índice GLOBAL de la vela evaluada. Devuelve 1 si el FVG quedó
+# completamente mitigado en esta vela (el bucle llamador debe detenerse),
+# 0 en cualquier otro caso (incluyendo recorte parcial, que sigue
+# evaluándose en velas futuras).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _apply_fvg_mitigation {
+    my ($self, $fvg, $c, $g) = @_;
+    my ($bottom, $top) = ($fvg->{bottom}, $fvg->{top});
+
+    return 0 if $c->{high} < $bottom || $c->{low} > $top;   # sin solape
+
+    if ($c->{low} <= $bottom && $c->{high} >= $top) {
+        $fvg->{state}         = 'mitigated';
+        $fvg->{g_mitigated_at}= $g;
+        return 1;
+    }
+    elsif ($c->{low} <= $bottom) {
+        $fvg->{bottom} = $c->{high};
+    }
+    elsif ($c->{high} >= $top) {
+        $fvg->{top} = $c->{low};
+    }
+    else {
+        return 0;
+    }
+
+    if ($fvg->{top} - $fvg->{bottom} <= 0) {
+        $fvg->{state}         = 'mitigated';
+        $fvg->{g_mitigated_at}= $g;
+        return 1;
+    }
+    return 0;
+}
+
+
+# Liquidity_indicators::_calc_atr). Se duplica aquí en vez de compartir
+# código entre packages para no crear un acoplamiento nuevo entre
+# SMC_Structures y Liquidity — ambos son consumidores independientes del
+# mismo cálculo estándar.
+sub _calc_atr_simple {
+    my ($self, $data, $period) = @_;
+    my (@tr, @atr);
+
+    for my $i (0 .. $#$data) {
+        my $c = $data->[$i];
+        my $tr;
+        if ($i == 0) {
+            $tr = $c->{high} - $c->{low};
+        } else {
+            my $pc = $data->[$i - 1]{close};
+            my $a = $c->{high} - $c->{low};
+            my $b = abs($c->{high} - $pc);
+            my $d = abs($c->{low}  - $pc);
+            $tr = $a > $b ? ($a > $d ? $a : $d) : ($b > $d ? $b : $d);
+        }
+        push @tr, $tr;
+
+        if ($i < $period - 1) {
+            push @atr, undef;
+        } elsif ($i == $period - 1) {
+            my $sum = 0; $sum += $_ for @tr[0 .. $period - 1];
+            push @atr, $sum / $period;
+        } else {
+            push @atr, ($atr[-1] * ($period - 1) + $tr) / $period;
+        }
+    }
+    return \@atr;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -59,6 +59,12 @@ sub new {
     my ($class, %args) = @_;
     my $self = {
         scale => Market::Panels::Scales->new(),
+
+        # Spec del profesor: "el sistema debe permitir configurar si el
+        # rectángulo desaparece o simplemente deja de extenderse" al
+        # mitigarse un FVG. 'hide' (default) | 'freeze'. Ver _draw_fvgs().
+        fvg_on_mitigate => $args{fvg_on_mitigate} // 'hide',
+
         # Visibilidad individual — todos desactivados al arrancar.
         # El usuario activa los que necesita desde el menú Overlays.
         # Esto evita dibujar miles de elementos en el primer frame y
@@ -334,18 +340,111 @@ sub _draw_events {
 # el tiempo real). Pasado 1.5x la ventana de fade, se deja de dibujar para
 # no saturar el canvas de rectángulos ya irrelevantes.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_fvgs — Punto 3.3 / cronograma 29/06: "FVG con el desvanecimiento
+# progresivo en el tiempo" (Fase 2 del plan).
+#
+# El Indicator (_detect_fvg) ya expone todo lo necesario vía fvgs_in_range():
+#   { index, direction ('up'|'down'), top, bottom, mitigated_at }
+# Este overlay SOLO decide cómo se ve — ninguna lógica de detección aquí.
+#
+# ── FIX (retroalimentación del profesor: "todo FVG consumido debe
+# desaparecer") ────────────────────────────────────────────────────────
+# ANTES: un FVG mitigado seguía dibujándose (desvanecido) hasta 75 velas
+# después de mitigarse (`$FVG_FADE_WINDOW * 1.5`) — con el 99.5% de los
+# FVGs mitigándose eventualmente en 1m, esto llenaba el canvas de
+# rectángulos "fantasma" ya irrelevantes en todo momento.
+# AHORA: en cuanto `mitigated_at` está definido, el FVG deja de dibujarse
+# por completo — sin ventana de fade posterior. El desvanecimiento
+# progresivo (que sí pide el cronograma) queda solo para los FVG AÚN
+# ACTIVOS (no mitigados), que se desvanecen con la edad desde su formación
+# hasta el cursor/borde visible, con el mismo tope de $FVG_FADE_WINDOW*1.5
+# para no dejar cajas activas muy viejas indefinidamente.
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_fvgs — Punto 3.3 / cronograma 29/06: "FVG con el desvanecimiento
+# progresivo en el tiempo" (Fase 2 del plan).
+#
+# El Indicator (_detect_fvg) ya expone todo lo necesario vía fvgs_in_range():
+#   { index, direction ('up'|'down'), top, bottom, mitigated_at }
+# Este overlay SOLO decide cómo se ve — ninguna lógica de detección aquí.
+#
+# ── FIX 1 (retroalimentación del profesor: "todo FVG consumido debe
+# desaparecer") ────────────────────────────────────────────────────────
+# En cuanto `mitigated_at` está definido, el FVG deja de dibujarse por
+# completo — sin ventana de fade posterior.
+#
+# ── FIX 2 (reportado tras el fix anterior: "los FVG solo aparecen al
+# final del gráfico, eso no debería pasar") ────────────────────────────
+# La versión anterior de este fix, sin querer, heredó un tope de edad
+# (`$FVG_FADE_WINDOW * 1.5` = 75 velas) que ANTES servía para dejar de
+# dibujar un FVG YA MITIGADO tras un rato — pero se aplicaba también a los
+# FVG que NUNCA se mitigan. Eso contradice la definición misma de un FVG:
+# es una zona de desequilibrio a la que el precio puede volver en
+# cualquier momento futuro, no algo que expira solo por el paso del
+# tiempo. Con el fade window aplicado a los activos, cualquier FVG sin
+# rellenar de más de 75 velas de antigüedad desaparecía del todo — por
+# eso solo se veían los formados recientemente cerca del cursor.
+#
+# Ahora: un FVG activo (sin mitigar) SIEMPRE se dibuja mientras intersecte
+# el rango visible, sin importar su edad — solo cambia qué tan disperso
+# (desvanecido) se ve el patrón -stipple. _fvg_fade_stipple() ya clampa
+# correctamente en el patrón más disperso ('gray12') para edades grandes,
+# así que no hace falta ningún tope adicional aquí.
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_fvgs — Punto 3.3 / cronograma 29/06: "FVG con el desvanecimiento
+# progresivo en el tiempo" (Fase 2 del plan).
+#
+# El Indicator (_detect_fvg) ya expone todo lo necesario vía fvgs_in_range():
+#   { index, direction ('up'|'down'), top, bottom, state, mitigated_at, ... }
+# Este overlay SOLO decide cómo se ve — ninguna lógica de detección aquí.
+#
+# ── FIX 1 (retroalimentación del profesor: "todo FVG consumido debe
+# desaparecer") ────────────────────────────────────────────────────────
+# En cuanto el FVG queda 'mitigated', deja de dibujarse por completo —
+# sin ventana de fade posterior. (Comportamiento por defecto: 'hide'.)
+#
+# ── FIX 2 (reportado tras el fix anterior: "los FVG solo aparecen al
+# final del gráfico") ──────────────────────────────────────────────────
+# Un FVG activo (sin mitigar) SIEMPRE se dibuja mientras intersecte el
+# rango visible, sin importar su edad — solo cambia qué tan disperso
+# (desvanecido) se ve el patrón -stipple, nunca su visibilidad.
+#
+# ── FIX 3 (spec del profesor: "el sistema debe permitir configurar si el
+# rectángulo desaparece o simplemente deja de extenderse") ─────────────
+# Nuevo parámetro del constructor: $self->{fvg_on_mitigate}, 'hide'
+# (default, comportamiento del FIX 1) o 'freeze' — en 'freeze', un FVG
+# mitigado se sigue dibujando pero congelado: su borde derecho queda fijo
+# en mitigated_at (ya no se extiende con el cursor) y su zona de precio
+# queda en el estado final que tenía justo al mitigarse (puede ser más
+# angosta que la original si hubo recortes parciales antes del cierre
+# completo). Se dibuja con el stipple más disperso (histórico, no activo).
+# ─────────────────────────────────────────────────────────────────────────────
 sub _draw_fvgs {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+    my $on_mitigate = $self->{fvg_on_mitigate} // 'hide';
 
     for my $fvg (@{ $smc->fvgs_in_range($start, $end) }) {
-        my $i1 = $fvg->{index};
-        my $i2 = defined $fvg->{mitigated_at} ? $fvg->{mitigated_at} : $end;
+        my $is_mitigated = defined $fvg->{mitigated_at};
 
-        # Edad de referencia para el desvanecimiento: hasta mitigated_at si
-        # ya se rellenó (queda fijo, no sigue "envejeciendo" después), o
-        # hasta $end si sigue activo (envejece con el cursor/replay).
-        my $age = (defined $fvg->{mitigated_at} ? $fvg->{mitigated_at} : $end) - $i1;
-        next if $age > $FVG_FADE_WINDOW * 1.5;   # demasiado viejo: no saturar el canvas
+        next if $is_mitigated && $on_mitigate eq 'hide';   # consumido -> desaparece
+
+        my $i1 = $fvg->{index};
+        my $i2;
+        my $stipple;
+
+        if ($is_mitigated) {
+            # 'freeze': congelado en su último estado, sin seguir extendiéndose.
+            $i2      = $fvg->{mitigated_at};
+            $stipple = 'gray12';   # histórico: siempre el más disperso
+        } else {
+            # Activo: se extiende hasta el borde visible/cursor, y el fade
+            # progresa con la edad desde la formación (sin tope de tiempo).
+            $i2 = $end;
+            my $age = $end - $i1;
+            $stipple = _fvg_fade_stipple($age, $FVG_FADE_WINDOW);
+        }
 
         $i1 = $start if $i1 < $start;
         $i2 = $end   if $i2 > $end;
@@ -357,8 +456,7 @@ sub _draw_fvgs {
         my $y_bot = $self->{scale}->price_to_y($fvg->{bottom}, $min, $max, $top, $h);
         next if $y_bot < $top || $y_top > $top + $h;
 
-        my $color   = $FVG_COLOR{ $fvg->{direction} } // '#787b86';
-        my $stipple = _fvg_fade_stipple($age, $FVG_FADE_WINDOW);
+        my $color = $FVG_COLOR{ $fvg->{direction} } // '#787b86';
 
         $canvas->createRectangle($x1, $y_top, $x2, $y_bot,
             -fill    => $color,
