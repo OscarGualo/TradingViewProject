@@ -622,15 +622,62 @@ sub _draw_support_resistance {
 # usa latest_trendlines_before($end, 2): solo los 2 canales MÁS RECIENTES
 # por tipo (resistencia/soporte) hasta el cursor, sin importar el zoom —
 # como una herramienta de canal real, no "todo lo que cabe en pantalla".
+#
+# ── FIX 2 ("ya no se ve como canal continuo pegado al precio") ────────────
+# El código anterior extendía las 2 trendlines devueltas hasta $end usando
+# CADA UNA su propia pendiente — la más antigua de las 2 se extrapolaba muy
+# más allá de su point2 real y divergía del precio (se veía como una línea
+# suave que ya no seguía las velas). Ahora solo se extiende hasta $end la
+# trendline MÁS RECIENTE de cada tipo (la que no tiene sucesora todavía); la
+# anterior se dibuja acotada a su propio point1→point2 real, que es
+# exactamente el tramo donde esa pendiente sí es válida.
+#
+# ── FIX 3 ("solo dibuja una parte del gráfico, no funciona en Replay") ────
+# latest_trendlines_before($end, 2) devuelve como MÁXIMO 2 canales por tipo
+# sin importar el ancho del viewport visible — si el viewport es más ancho
+# que esos 2 tramos (o, en Replay, si esos 2 no llegan a cubrir la ventana
+# mostrada), queda vacío el resto de la pantalla. Se reemplaza por
+# trendlines_in_range($start,$end) (ya existía, sin usar) — el mismo patrón
+# *_in_range(start,end) que ya usan swings/FVG/OB/S-R y que sí funciona en
+# Replay, porque $start/$end ya vienen acotados al cursor por ChartEngine.
+# La trendline "activa" de cada tipo (la última, sin sucesora) se incluye
+# aparte del filtro geométrico: su tramo REAL puede caer fuera del viewport
+# aunque su proyección extendida hasta $end sí lo alcance.
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_trendlines {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
-    for my $tl (@{ $smc->latest_trendlines_before($end, 2) }) {
+    my $all = $smc->values_trendlines();
+    return unless @$all;
+
+    # Trendline más reciente de cada tipo (sin sucesora todavía): es el
+    # "canal activo" y se extiende hasta $end. $all está ordenado por
+    # point1.index, así que escanear desde el final da directamente la más
+    # reciente de cada tipo (point2 crece monótonamente dentro de un tipo).
+    my %active_tl;
+    for (my $i = $#$all; $i >= 0 && keys(%active_tl) < 2; $i--) {
+        my $tl = $all->[$i];
+        $active_tl{ $tl->{kind} } //= $tl;
+    }
+
+    # Candidatas: todo lo que intersecta geométricamente el viewport (rápido,
+    # bsearch ya existente) + las activas de cada tipo (pueden no intersectar
+    # geométricamente pero su extensión hasta $end sí llega al viewport).
+    my %seen;
+    my @candidates;
+    for my $tl (@{ $smc->trendlines_in_range($start, $end) }, values %active_tl) {
+        next if $seen{$tl}++;
+        push @candidates, $tl;
+    }
+
+    for my $tl (@candidates) {
         my $i1 = $tl->{point1}{index};
-        my $i2 = $end;                       # extender el canal hacia adelante
+        my $is_active = (defined $active_tl{ $tl->{kind} } && $active_tl{ $tl->{kind} } == $tl);
+        my $i2 = $is_active ? $end : $tl->{point2}{index};
         next if $i1 > $end;                  # canal fuera de rango (no debería pasar)
         $i1 = $start if $i1 < $start;
+        $i2 = $end   if $i2 > $end;
+        next if $i2 <= $i1;
 
         my $p1 = $tl->{slope} * $i1 + $tl->{intercept};
         my $p2 = $tl->{slope} * $i2 + $tl->{intercept};
