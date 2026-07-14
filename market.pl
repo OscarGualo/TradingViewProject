@@ -30,14 +30,12 @@ if (@ARGV) {
     my @candidates = (
         "$FindBin::Bin/2026_04.csv",
         "$FindBin::Bin/2026_05.csv",
-        "$FindBin::Bin/2026_06_29.csv",
-        # Fallback al nombre original del proyecto anterior
-        "$FindBin::Bin/2026_03.csv",
+        "$FindBin::Bin/2026_06.csv",
+        "$FindBin::Bin/2026_07_13.csv",
     );
     for my $f (@candidates) {
         push @csv_files, $f if -f $f;
     }
-    # Desduplicar: si solo existe 2026_03.csv (el que era abril renombrado), usarlo
     if (!@csv_files) {
         die "No se encontraron archivos CSV.\n"
           . "Uso: perl market.pl [archivo1.csv archivo2.csv ...]\n";
