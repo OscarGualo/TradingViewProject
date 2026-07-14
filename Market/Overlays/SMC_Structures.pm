@@ -574,6 +574,13 @@ sub _draw_order_blocks {
 # Cada nivel se dibuja como una línea horizontal punteada extendida desde su
 # primer toque hasta el borde derecho visible. Resistencia = rojo con etiqueta
 # "R"; Soporte = verde con etiqueta "S".
+#
+# ── FIX (contraste contra el PDF, sección 9): la etiqueta se dibujaba SIEMPRE
+# arriba de la línea (y-6), tanto para resistencia como para soporte. El PDF
+# exige explícitamente "below support **or** above resistance" — el soporte
+# debe quedar por DEBAJO (para no tapar el precio que actúa como piso encima
+# de él) y la resistencia por ARRIBA (para no tapar el precio que actúa como
+# techo debajo de ella). Ahora el offset de Y depende del tipo de nivel.
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_support_resistance {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
@@ -596,7 +603,8 @@ sub _draw_support_resistance {
             -width => 1,
             -tags  => 'smc_sr',
         );
-        $canvas->createText($x1 + 4, $y - 6,
+        my $label_y = $is_res ? ($y - 8) : ($y + 8);   # above resistance / below support
+        $canvas->createText($x1 + 4, $label_y,
             -anchor => 'w',
             -text   => $is_res ? 'R' : 'S',
             -fill   => $color,
@@ -650,13 +658,23 @@ sub _draw_trendlines {
     my $all = $smc->values_trendlines();
     return unless @$all;
 
-    # Trendline más reciente de cada tipo (sin sucesora todavía): es el
-    # "canal activo" y se extiende hasta $end. $all está ordenado por
-    # point1.index, así que escanear desde el final da directamente la más
-    # reciente de cada tipo (point2 crece monótonamente dentro de un tipo).
+    # Trendline "activa" de cada tipo: la más reciente CUYO point1 ya empezó
+    # (<= $end) — es la que sigue vigente en el borde derecho del viewport
+    # actual y se extiende hasta $end. $all está ordenado por point1.index,
+    # así que escanear desde el final da directamente la más reciente de
+    # cada tipo (point2 crece monótonamente dentro de un tipo).
+    #
+    # FIX: antes se tomaba sencillamente la última de TODO el histórico
+    # (`$all->[-1]` por tipo), sin filtrar por $end. En modo normal (fuera
+    # de Replay) con el usuario viendo una parte antigua del historial —no
+    # el borde derecho absoluto del dataset cargado—, esa trendline global
+    # tenía point1.index MUY por delante de $end y se descartaba entera
+    # (`next if $i1 > $end`), así que nunca había "activa" y la etiqueta
+    # "Canal R/S" no aparecía nunca salvo mirando la última vela cargada.
     my %active_tl;
     for (my $i = $#$all; $i >= 0 && keys(%active_tl) < 2; $i--) {
         my $tl = $all->[$i];
+        next if $tl->{point1}{index} > $end;
         $active_tl{ $tl->{kind} } //= $tl;
     }
 
@@ -696,6 +714,24 @@ sub _draw_trendlines {
             -width => 1,
             -tags  => 'smc_trend',
         );
+
+        # FIX (contraste contra el PDF, sección 9): "Trendlines/Channels:
+        # below or above" pedía una etiqueta de posicionamiento igual que
+        # Support/Resistance, y este overlay no dibujaba ninguna. Se agrega
+        # solo en el canal ACTIVO de cada tipo (no en cada tramo histórico
+        # acotado, para no saturar el canvas con zoom muy alejado) — misma
+        # convención que S/R: por encima si es resistencia, por debajo si
+        # es soporte, cerca del extremo derecho (donde el canal sigue vivo).
+        if ($is_active) {
+            my $label_y = ($tl->{kind} eq 'resistance') ? ($y2 - 8) : ($y2 + 8);
+            $canvas->createText($x2 - 4, $label_y,
+                -anchor => 'e',
+                -text   => ($tl->{kind} eq 'resistance') ? 'Canal R' : 'Canal S',
+                -fill   => $color,
+                -font   => ['Arial', 7, 'bold'],
+                -tags   => 'smc_trend',
+            );
+        }
     }
 }
 
