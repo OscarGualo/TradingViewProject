@@ -44,6 +44,7 @@ sub new {
         depth      => $a{depth}      // 5,     # velas de contexto a cada lado
         max_pivots => $a{max_pivots} // 15,    # "Amount of ZigZag Volume Profiles"
         atr_period => $a{atr_period} // 14,    # ATR para threshold dinámico
+        resolution => $a{resolution} // 30,    # ZigZag Resolution (min) — sensibilidad
         color      => $a{color}      // '#2962ff',  # azul (dirección externa)
         # parámetros del Swing Channel / Volume Profile — almacenados por
         # completitud del PDF pero no se renderizan (Display: off)
@@ -70,6 +71,9 @@ sub reset {
 }
 
 sub values { return $_[0]->{segments}; }   # contrato IndicatorManager
+
+sub resolution     { return $_[0]->{resolution}; }
+sub set_resolution { my ($self, $r) = @_; $self->{resolution} = $r; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 sub calculate_all {
@@ -103,6 +107,16 @@ sub calculate_all {
         $min_move[$i] = $a * sqrt($vw);
     }
 
+    # ── Paso 3b: factor de sensibilidad según resolution (mismo mapeo lineal
+    # que ZigZagMTF, línea ~106-111 de ese archivo). Normalizado para que
+    # resolution=30 (default) reproduzca exactamente el umbral original.
+    my $res    = $self->{resolution};
+    my $factor = $res <= 15 ? 2.5
+               : $res <= 30 ? 3.0
+               : $res <= 60 ? 5.0
+               :              3.0 + ($res - 30) / 15;
+    my $res_ratio = $factor / 3.0;
+
     # ── Paso 4: detección de pivotes con threshold de volumen ─────────────
     my @cand;
     for my $i ($dep .. $n - 1 - $dep) {
@@ -133,7 +147,7 @@ sub calculate_all {
         } else {
             # dirección opuesta: verificar que el movimiento supere el threshold
             my $move    = abs($c->{price} - $last->{price});
-            my $thresh  = $min_move[$c->{idx}] * $dep;
+            my $thresh  = $min_move[$c->{idx}] * $dep * $res_ratio;
             push @piv, $c if $move >= $thresh;
         }
     }

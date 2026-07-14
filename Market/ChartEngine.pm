@@ -278,7 +278,26 @@ sub run {
         zzmtf    => 'ZZMTF (Dir. Interna)',
         zzvolume => 'ZZ Volume (Dir. Externa)',
     );
+    my %zz_ind_name = (
+        zzmtf    => 'ZigZagMTF',
+        zzvolume => 'ZigZagVolume',
+    );
     my @zz_order = qw(zzmtf zzvolume);
+    my @zz_res_order = (15, 30, 60);
+    my %zz_res = (zzmtf => 30, zzvolume => 30);   # 1.2: TF de referencia activo por indicador
+    my %zz_res_btns;   # {$key}{$tf} => Button
+    my $_refresh_zz_res_btns = sub {
+        my ($key) = @_;
+        for my $tf (@zz_res_order) {
+            my $b = $zz_res_btns{$key}{$tf};
+            next unless $b;
+            if ($tf == $zz_res{$key}) {
+                $b->configure(-background => '#2962ff', -foreground => '#ffffff', -activebackground => '#1a47cc');
+            } else {
+                $b->configure(-background => '#1e222d', -foreground => '#b2b5be', -activebackground => '#2a2e39');
+            }
+        }
+    };
     my $zz_box = $ov_win->Frame(-background => '#1e222d')
         ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
     $zz_box->Label(-text => 'ZigZag', -background => '#1e222d',
@@ -298,6 +317,35 @@ sub run {
             -activebackground => '#1e222d', -activeforeground => '#ffffff',
             -selectcolor => '#26a69a', -font => ['Arial', 9], -anchor => 'w',
         )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+
+        # 1.2: selector de temporalidad de referencia (15/30/60), fila compacta
+        # bajo cada checkbutton — mismo estilo que los botones de TF principal.
+        my $res_row = $zz_box->Frame(-background => '#1e222d')
+            ->pack(-side => 'top', -anchor => 'w', -padx => [16, 0], -pady => [0, 6]);
+        for my $tf (@zz_res_order) {
+            my $tf_copy = $tf;
+            my $rb = $res_row->Button(
+                -text             => "${tf}m",
+                -relief           => 'flat',
+                -borderwidth      => 0,
+                -padx             => 6,
+                -pady             => 2,
+                -font             => ['Arial', 8, 'bold'],
+                -foreground       => '#b2b5be',
+                -background       => '#1e222d',
+                -activeforeground => '#ffffff',
+                -activebackground => '#2a2e39',
+                -cursor           => 'hand2',
+            );
+            $rb->configure(-command => sub {
+                $zz_res{$k} = $tf_copy;
+                $self->_zz_change_resolution($zz_ind_name{$k}, $tf_copy);
+                $_refresh_zz_res_btns->($k);
+            });
+            $rb->pack(-side => 'left', -padx => 1);
+            $zz_res_btns{$k}{$tf} = $rb;
+        }
+        $_refresh_zz_res_btns->($k);
     }
 
     my $overlays_btn = $top->Button(
@@ -933,6 +981,22 @@ sub _replay_recalc_indicators {
 
     my $zzv = $ind->get_indicator('ZigZagVolume');
     $zzv->calculate_all($wproxy) if defined $zzv;
+}
+
+# 1.2: cambia en caliente la temporalidad de referencia de ZigZagMTF/ZigZagVolume
+# y fuerza un recálculo COMPLETO (no incremental) respetando el modo Replay —
+# mismo criterio de "no fuga de velas futuras" que el resto de recálculos.
+sub _zz_change_resolution {
+    my ($self, $name, $tf) = @_;
+    my $ind = $self->{indicators}->get_indicator($name);
+    return unless defined $ind;
+    $ind->set_resolution($tf);
+    if ($self->{replay_mode}) {
+        $self->_replay_recalc_indicators();
+    } else {
+        $ind->calculate_all($self->{market});
+    }
+    $self->request_draw();
 }
 
 # Centra la vista alrededor del replay_cursor manteniendo contexto histórico.

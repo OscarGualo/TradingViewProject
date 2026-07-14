@@ -13,26 +13,9 @@
 
 Esta persona cubre dos bloques de trabajo independientes entre sí (no comparten ningún archivo), en el orden que prefiera.
 
-### Bloque A — Datos + temporalidades en ZigZag
 
-**1.1. Integrar la data nueva subida al aula virtual**
-- Copiar el/los CSV nuevo(s) al directorio del script, con el mismo formato que ya usa el proyecto: `time,open,high,low,close,Volume`, timestamps ISO-8601 (`2026-04-01T00:00:00-05:00`).
-- `market.pl` autodescubre `2026_04.csv`, `2026_05.csv`, `2026_06_29.csv` (fallback `2026_03.csv`) — si el archivo nuevo tiene otro nombre/mes, hay que **añadirlo a esa lista de autodiscovery** en `market.pl` (no solo dejarlo en la carpeta).
-- Verificar que `MarketData::build_tf_candles` genera bien las temporalidades derivadas (5/15/60/120/240/D/W) a partir de la nueva data 1m — correr la app y revisar visualmente que no haya huecos/gaps de velas en el candlestick al cambiar de TF.
 
-**1.2. Selector de temporalidad en ZigZag (los 2 tipos)**
-- **Problema actual:** `ZigZagMTF__indicator.pm` tiene el TF de referencia **hardcodeado a 30 minutos** (`resolution => $a{resolution} // 30` en `sub new`, línea ~42). El parámetro existe en el constructor pero **no hay ningún control de UI que lo cambie** — el usuario no puede seleccionar 15m/30m/60m desde la interfaz.
-- **Qué hay que construir:**
-  1. En `ChartEngine.pm`, dentro del panel de Overlays (Toplevel con Checkbuttons — recuerda que en este proyecto los menús NO son Tk::Menu nativos, ver nota de arquitectura en `CLAUDE.md`), agregar un control de selección de temporalidad para ZigZag (radiobuttons o botones tipo los de cambio de TF del gráfico principal: 15/30/60).
-  2. Ese control debe llamar a `Market::Indicators::ZigZagMTF->new(resolution => $tf)` — recreando el indicador y re-registrándolo en `IndicatorManager` (o exponiendo un método `set_resolution($tf)` que fuerce recálculo completo, no incremental).
-  3. Repetir el mismo patrón para `ZigZagVolume__indicator.pm` — revisar su `sub new` (línea ~39) para ver si ya acepta un parámetro de TF/periodo; si no, agregarlo siguiendo el mismo mapeo lineal resolución→factor que ya usa ZigZagMTF (línea ~106-111 de ese archivo) como referencia de diseño.
-  4. `ZigZag_overlay.pm` debe leer la resolución activa desde el indicador (no un valor fijo) para que la etiqueta en pantalla (ej. "ZZMTF (Dir. Interna) — 30m") refleje la temporalidad seleccionada — así el usuario ve con qué TF está mirando el zigzag, tal como en TradingView.
 
-### Criterio de aceptación (Bloque A)
-- La app arranca con la data nueva sin errores y sin huecos de velas en ninguna temporalidad.
-- Se puede cambiar la temporalidad de referencia de ZZMTF y de ZZ Volume desde la UI, en caliente, sin reiniciar la app, y el overlay se redibuja con el nuevo cálculo.
-
----
 
 ### Bloque B — Arreglo de etiquetas SMC (FVG, Order Blocks, Trendlines/Channels)
 

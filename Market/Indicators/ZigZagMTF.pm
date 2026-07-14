@@ -73,6 +73,9 @@ sub reset {
 
 sub values { return $_[0]->{segments}; }   # contrato mínimo del IndicatorManager
 
+sub resolution     { return $_[0]->{resolution}; }
+sub set_resolution { my ($self, $r) = @_; $self->{resolution} = $r; }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # calculate_all — motor principal ATR-based sobre la temporalidad activa

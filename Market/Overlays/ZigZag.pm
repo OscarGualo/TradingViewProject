@@ -73,14 +73,15 @@ sub draw {
     my $max   = $state->{price_max};
     my $top   = $state->{top};
     my $h     = $state->{price_h};   # igual que PricePanel — incluye el área de volumen
+    my $left  = $state->{left};
 
     return unless defined $min && defined $max;
 
     # ZZVolume debajo (capa de fondo) para que ZZMTF quede encima
-    $self->_draw_zzvolume($canvas, $zzv,   $x_of, $start, $end, $min, $max, $top, $h)
+    $self->_draw_zzvolume($canvas, $zzv,   $x_of, $start, $end, $min, $max, $top, $h, $left)
         if $self->{visible}{zzvolume} && defined $zzv;
 
-    $self->_draw_zzmtf($canvas,   $zzmtf, $x_of, $start, $end, $min, $max, $top, $h)
+    $self->_draw_zzmtf($canvas,   $zzmtf, $x_of, $start, $end, $min, $max, $top, $h, $left)
         if $self->{visible}{zzmtf}   && defined $zzmtf;
 }
 
@@ -88,7 +89,13 @@ sub draw {
 # _draw_zzmtf — segmentos y etiquetas de la dirección INTERNA
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_zzmtf {
-    my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h) = @_;
+    my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h, $left) = @_;
+
+    # 1.2: etiqueta con la temporalidad de referencia activa (no fija) para que
+    # el usuario vea con qué TF está mirando el zigzag, como en TradingView.
+    $canvas->createText($left + 8, $top + 16, -anchor => 'w',
+        -text => 'ZZMTF (Dir. Interna) — ' . $ind->resolution . 'm',
+        -fill => $COLOR_LABEL, -tags => 'overlay');
 
     # Segmentos confirmados
     # _seg_coords interpola los puntos cuando el from/to cae fuera de la ventana
@@ -136,7 +143,12 @@ sub _draw_zzmtf {
 # Solo líneas, sin etiquetas (PDF pág. 5)
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_zzvolume {
-    my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h) = @_;
+    my ($self, $canvas, $ind, $x_of, $start, $end, $min, $max, $top, $h, $left) = @_;
+
+    # 1.2: etiqueta con la temporalidad de referencia activa (no fija).
+    $canvas->createText($left + 8, $top + 32, -anchor => 'w',
+        -text => 'ZZ Volume (Dir. Externa) — ' . $ind->resolution . 'm',
+        -fill => $COLOR_EXT, -tags => 'overlay');
 
     # Segmentos confirmados
     my $segs = $ind->segments_in_range($start, $end);
