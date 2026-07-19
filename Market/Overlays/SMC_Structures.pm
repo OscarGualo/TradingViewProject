@@ -83,6 +83,7 @@ sub new {
             mtf_d      => 0,   # MTF Diario  (PDH/PDL)
             mtf_w      => 0,   # MTF Semanal (PWH/PWL)
             mtf_m      => 0,   # MTF Mensual (PMH/PML)
+            reversal   => 0,   # Sección 5: alerta de Reversal (Grab)
         },
     };
     bless $self, $class;
@@ -149,6 +150,9 @@ sub draw {
 
     $self->_draw_mtf_levels($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
         if $self->{visible}{mtf_d} || $self->{visible}{mtf_w} || $self->{visible}{mtf_m};
+
+    $self->_draw_reversal_alerts($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{reversal};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,6 +275,18 @@ sub _draw_events {
                       : $has_choch             ? 'CHoCH'
                       :                          'BOS';
 
+            # ── Sección 5: alta confianza por concurrencia con liquidez ──────
+            # Si algún evento del grupo fue marcado por la máquina de estados de
+            # liquidez (Sweep->CHoCH / Run->BOS), se resalta la etiqueta con un
+            # asterisco, el origen, y un color más intenso.
+            my ($hi_ev) = grep { $_->{confidence} } @grp;
+            my $high_conf = defined $hi_ev;
+            if ($high_conf) {
+                my $src = ($hi_ev->{liq_source} // '') eq 'sweep' ? 'Sweep' : 'Run';
+                $label .= "* ($src)";
+                $color = ($ev->{direction} eq 'up') ? '#00e676' : '#ff1744';  # más intenso
+            }
+
             # ── Línea horizontal ─────────────────────────────────────────────
             # Estilo: sólido para externo (estructura mayor), dashed para interno
             my $is_ext = ($ev->{scope} eq 'external');
@@ -307,7 +323,8 @@ sub _draw_events {
                 -text   => $label,
                 -fill   => $color,
                 -anchor => 'center',
-                -font   => ['Arial', 7, ($has_choch ? 'bold italic' : 'bold')],
+                -font   => ['Arial', ($high_conf ? 9 : 7),
+                            ($has_choch ? 'bold italic' : 'bold')],
                 -tags   => 'smc_event',
             );
         }
@@ -474,6 +491,17 @@ sub _draw_fvgs {
             -outline => '',
             -tags    => 'smc_fvg',
         );
+
+        # ── Sección 5: "Zona de Alta Reacción" (FVG en la vela de un Sweep/Grab).
+        # Se destaca con un borde ámbar y una mini etiqueta "HR", como gatillo
+        # optimizado para el constructor de estrategias.
+        if ($fvg->{high_reaction}) {
+            $canvas->createRectangle($x1, $y_top, $x2, $y_bot,
+                -outline => '#f0b90b', -width => 1, -fill => '', -tags => 'smc_fvg');
+            $canvas->createText($x1 + 3, $y_top + 6,
+                -anchor => 'w', -text => 'HR', -fill => '#f0b90b',
+                -font => ['Arial', 6, 'bold'], -tags => 'smc_fvg');
+        }
     }
 }
 
@@ -941,6 +969,38 @@ sub _draw_mtf_levels {
                 -tags   => 'smc_mtf',
             );
         }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_reversal_alerts — Sección 5: alerta visual de Reversal estructural
+# generada por un Liquidity Grab (absorción institucional inmediata). Se dibuja
+# un marcador (triángulo + "REV") sobre la vela del barrido, apuntando en la
+# dirección esperada del giro (abajo si el grab fue en un techo, arriba si en
+# un piso). Índices globales; el indicador ya los acota al cursor en replay.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_reversal_alerts {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+    return unless $smc->can('reversal_alerts');
+
+    for my $a (@{ $smc->reversal_alerts() }) {
+        next if $a->{index} < $start || $a->{index} > $end;
+        my $x = $x_of->($a->{index} - $start);
+        my $y = $self->{scale}->price_to_y($a->{price}, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        my $down  = ($a->{direction} eq 'down');
+        my $color = $down ? '#ff1744' : '#00e676';
+        # Triángulo apuntando en la dirección del giro esperado.
+        my $dy = $down ? 9 : -9;
+        $canvas->createPolygon(
+            $x - 5, $y, $x + 5, $y, $x, $y + $dy,
+            -fill => $color, -outline => $color, -tags => 'smc_reversal',
+        );
+        $canvas->createText($x, $y + ($down ? -8 : 8),
+            -anchor => 'center', -text => 'REV', -fill => $color,
+            -font => ['Arial', 6, 'bold'], -tags => 'smc_reversal',
+        );
     }
 }
 

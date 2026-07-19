@@ -194,6 +194,7 @@ sub run {
         swings => 0, bos => 0, choch => 0, fvg => 0, fib => 0,
         ob => 0, sr => 0, trend => 0,
         strongweak => 0, mtf_d => 0, mtf_w => 0, mtf_m => 0,
+        reversal => 0,
     );
     my %smc_menu_label = (
         swings     => 'HH / HL / LH / LL',
@@ -208,8 +209,9 @@ sub run {
         mtf_d      => 'MTF Diario',
         mtf_w      => 'MTF Semanal',
         mtf_m      => 'MTF Mensual',
+        reversal   => 'Reversal (Grab)',
     );
-    my @smc_order = qw(swings bos choch fvg fib ob sr trend strongweak mtf_d mtf_w mtf_m);
+    my @smc_order = qw(swings bos choch fvg fib ob sr trend strongweak mtf_d mtf_w mtf_m reversal);
 
     my %liq_var = (
         bsl => 0, ssl => 0, eqh => 0, eql => 0, sweep => 0, grab => 0, run => 0,
@@ -975,6 +977,13 @@ sub _replay_recalc_indicators {
 
     my $liq = $ind->get_indicator('Liquidity');
     $liq->calculate_replay($wproxy) if defined $liq;
+
+    # Sección 5: tras recomputar SMC y Liquidity en la ventana, reconstruir la
+    # concurrencia estructural (Sweep->CHoCH, Run->BOS, Grab->Reversal, FVG->
+    # Alta Reacción). Replay-safe: ambos ya vienen acotados al cursor.
+    if (defined $smc && defined $liq && $smc->can('apply_liquidity_concurrency')) {
+        $smc->apply_liquidity_concurrency($liq);
+    }
 
     # ATR: intencionalmente NO se recalcula (ver comentario arriba).
 

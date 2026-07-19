@@ -235,6 +235,7 @@ sub reset {
     $self->{fibonacci} = [];
     $self->{strong_weak} = undef;
     $self->{mtf_levels} = undef;
+    $self->{reversal_alerts} = [];   # Sección 5: alertas de Reversal (Grab)
     # swing_trend NO se limpia aquí: lo fija _detect_bos_choch_pass en cada
     # cálculo (scope external). Si aún no corrió, swing_trend() devuelve
     # 'unknown' por el // en el accessor.
@@ -1656,6 +1657,98 @@ sub major_swings_in_range {
     my $hi = _bsearch_hi($arr, $end);
     return [] if $hi < $lo;
     return [ @{$arr}[$lo .. $hi] ];
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# apply_liquidity_concurrency — Sección 5 del PDF (Relación Estructural y de
+# Concurrencia). Se ejecuta DESPUÉS de que SMC y Liquidity terminaron su
+# calculate_all (eventos y niveles ya en índices GLOBALES), leyendo las
+# clasificaciones de la máquina de estados de liquidez y anotando la estructura:
+#
+#   · Sweep  -> el próximo CHoCH en dirección CONTRARIA al barrido queda de
+#               "alta confianza" (giro de mercado de alta precisión).
+#   · Run    -> el próximo BOS en la dirección de la aceptación queda de
+#               "alta confianza" (continuación de tendencia validada).
+#   · Grab   -> alerta visual de Reversal estructural (absorción institucional).
+#   · FVG formado en la vela del barrido (o la siguiente) tras un Sweep/Grab ->
+#     "Zona de Alta Reacción" (high_reaction), gatillo optimizado.
+#
+# Mantiene la separación de capas: NO se llama desde calculate_all (los
+# indicadores siguen siendo independientes); lo invoca el orquestador
+# (IndicatorManager::update_last / ChartEngine::_replay_recalc_indicators)
+# cuando ambos ya calcularon. Replay-safe: ambos vienen acotados al cursor.
+# ─────────────────────────────────────────────────────────────────────────────
+sub apply_liquidity_concurrency {
+    my ($self, $liq) = @_;
+    $self->{reversal_alerts} = [];
+    return unless $liq && $liq->can('values');
+
+    my $events = $self->{events};
+    my $W = $self->{concurrency_window} // 50;
+
+    for my $lv (@{ $liq->values() }) {
+        my $cls = $lv->{classification};
+        next unless defined $cls;
+        my $swept = $lv->{swept_at};
+        next unless defined $swept;
+
+        my $ceiling = ($lv->{kind} eq 'BSL' || $lv->{kind} eq 'EQH');
+
+        if ($cls eq 'Sweep') {
+            # Giro contrario al barrido: techo barrido -> CHoCH bajista; piso -> alcista.
+            my $dir = $ceiling ? 'down' : 'up';
+            $self->_boost_event($events, $swept, $W, 'CHoCH', $dir, 'sweep');
+            $self->_tag_reaction_fvg($swept);
+        }
+        elsif ($cls eq 'Run') {
+            # Continuación: aceptación arriba -> BOS alcista; abajo -> bajista.
+            my $dir  = $ceiling ? 'up' : 'down';
+            my $from = defined $lv->{resolved_at} ? $lv->{resolved_at} : $swept;
+            $self->_boost_event($events, $from, $W, 'BOS', $dir, 'run');
+        }
+        elsif ($cls eq 'Grab') {
+            push @{ $self->{reversal_alerts} }, {
+                index     => $swept,
+                direction => ($ceiling ? 'down' : 'up'),
+                price     => $lv->{price},
+            };
+            $self->_tag_reaction_fvg($swept);
+        }
+    }
+}
+
+# Marca el PRIMER evento del tipo/dirección dados en [$from, $from+$W] como de
+# alta confianza, anotando su origen de liquidez. Búsqueda binaria + escaneo
+# acotado sobre {events} (ordenado por index).
+sub _boost_event {
+    my ($self, $events, $from, $W, $type, $dir, $source) = @_;
+    return unless @$events;
+    my $lo = _bsearch_lo($events, $from);
+    for (my $i = $lo; $i <= $#$events; $i++) {
+        my $ev = $events->[$i];
+        last if $ev->{index} > $from + $W;
+        next unless $ev->{type} eq $type && $ev->{direction} eq $dir;
+        next if $ev->{confidence};                 # ya marcado por otro nivel
+        $ev->{confidence} = 'high';
+        $ev->{liq_source} = $source;
+        return;
+    }
+}
+
+# Marca como "Zona de Alta Reacción" el FVG formado en la vela del barrido o la
+# inmediatamente posterior (si existe alguno).
+sub _tag_reaction_fvg {
+    my ($self, $swept) = @_;
+    for my $idx ($swept, $swept + 1) {
+        my $fvg = $self->{fvgs_by_index}{$idx};
+        $fvg->{high_reaction} = 1 if $fvg;
+    }
+}
+
+# Alertas de Reversal (Grab) — para el Overlay. Índices globales.
+sub reversal_alerts {
+    my ($self) = @_;
+    return $self->{reversal_alerts} // [];
 }
 
 # Equivalente a swings_in_range pero para eventos BOS/CHoCH.

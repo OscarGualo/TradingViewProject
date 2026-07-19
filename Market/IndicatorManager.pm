@@ -19,6 +19,20 @@ sub update_last {
     for my $name (keys %{$self->{indicators}}) {
         $self->{indicators}{$name}->calculate_all($market_data);
     }
+    $self->apply_concurrency();
+}
+
+# Sección 5 del PDF (Relación Estructural y de Concurrencia): una vez que TODOS
+# los indicadores calcularon, se conecta la clasificación de la máquina de
+# estados de liquidez con la estructura SMC (Sweep->CHoCH, Run->BOS, Grab->
+# Reversal, FVG->Alta Reacción). Se hace aquí, fuera de los calculate_all, para
+# no romper la independencia de los indicadores. No-op si falta alguno.
+sub apply_concurrency {
+    my ($self) = @_;
+    my $smc = $self->{indicators}{'SMC_Structures'};
+    my $liq = $self->{indicators}{'Liquidity'};
+    return unless $smc && $liq && $smc->can('apply_liquidity_concurrency');
+    $smc->apply_liquidity_concurrency($liq);
 }
 
 sub get {
