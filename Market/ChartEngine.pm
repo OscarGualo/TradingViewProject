@@ -193,18 +193,23 @@ sub run {
     my %smc_var = (
         swings => 0, bos => 0, choch => 0, fvg => 0, fib => 0,
         ob => 0, sr => 0, trend => 0,
+        strongweak => 0, mtf_d => 0, mtf_w => 0, mtf_m => 0,
     );
     my %smc_menu_label = (
-        swings => 'HH / HL / LH / LL',
-        bos    => 'BOS',
-        choch  => 'CHoCH',
-        fvg    => 'FVG',
-        fib    => 'Fibonacci',
-        ob     => 'Order Blocks',
-        sr     => 'Support / Resistance',
-        trend  => 'Trendlines / Channels',
+        swings     => 'HH / HL / LH / LL',
+        bos        => 'BOS',
+        choch      => 'CHoCH',
+        fvg        => 'FVG',
+        fib        => 'Fibonacci',
+        ob         => 'Order Blocks',
+        sr         => 'Support / Resistance',
+        trend      => 'Trendlines / Channels',
+        strongweak => 'Strong / Weak H/L',
+        mtf_d      => 'MTF Diario',
+        mtf_w      => 'MTF Semanal',
+        mtf_m      => 'MTF Mensual',
     );
-    my @smc_order = qw(swings bos choch fvg fib ob sr trend);
+    my @smc_order = qw(swings bos choch fvg fib ob sr trend strongweak mtf_d mtf_w mtf_m);
 
     my %liq_var = (
         bsl => 0, ssl => 0, eqh => 0, eql => 0, sweep => 0, grab => 0, run => 0,

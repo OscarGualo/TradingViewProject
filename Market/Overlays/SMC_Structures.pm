@@ -70,15 +70,19 @@ sub new {
         # Esto evita dibujar miles de elementos en el primer frame y
         # mejora significativamente el tiempo de arranque y el draw().
         visible => {
-            swings => 0,
-            bos    => 0,
-            choch  => 0,
-            fvg    => 0,
-            fib    => 0,
-            ob     => 0,   # Order Blocks
-            sr     => 0,   # Support / Resistance
-            trend  => 0,   # Trendlines / Channels
-            daily  => 0,   # Near daily candle's body & wick (Fase 4)
+            swings     => 0,
+            bos        => 0,
+            choch      => 0,
+            fvg        => 0,
+            fib        => 0,
+            ob         => 0,   # Order Blocks
+            sr         => 0,   # Support / Resistance
+            trend      => 0,   # Trendlines / Channels
+            daily      => 0,   # Near daily candle's body & wick (Fase 4)
+            strongweak => 0,   # Strong/Weak High/Low (LuxAlgo)
+            mtf_d      => 0,   # MTF Diario  (PDH/PDL)
+            mtf_w      => 0,   # MTF Semanal (PWH/PWL)
+            mtf_m      => 0,   # MTF Mensual (PMH/PML)
         },
     };
     bless $self, $class;
@@ -139,6 +143,12 @@ sub draw {
 
     $self->_draw_daily_proximity($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
         if $self->{visible}{daily};
+
+    $self->_draw_strong_weak($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{strongweak};
+
+    $self->_draw_mtf_levels($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
+        if $self->{visible}{mtf_d} || $self->{visible}{mtf_w} || $self->{visible}{mtf_m};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,14 +541,26 @@ sub _draw_fibonacci {
     }
 }
 
+my $OB_MAX_RECENT = 5;   # LuxAlgo internalOrderBlocksSizeInput (default 5)
+
 sub _draw_order_blocks {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
-    for my $ob (@{ $smc->order_blocks_in_range($start, $end) }) {
+    # LuxAlgo: sólo los N Order Blocks NO MITIGADOS más recientes (un OB
+    # mitigado se elimina — no se dibuja). Se toman por índice descendente y
+    # se extienden a la derecha (extend right) hasta el borde visible.
+    my $all = $smc->values_order_blocks();
+    return unless $all && @$all;
+    my @live = grep { $_->{index} <= $end && !defined $_->{mitigated_at} } @$all;
+    @live = sort { $b->{index} <=> $a->{index} } @live;
+    @live = @live[0 .. $OB_MAX_RECENT - 1] if @live > $OB_MAX_RECENT;
+
+    for my $ob (@live) {
         my $i1 = $ob->{index};
-        my $i2 = defined $ob->{mitigated_at} ? $ob->{mitigated_at} : $end;
+        my $i2 = $end;                       # extend right mientras no mitigado
         $i1 = $start if $i1 < $start;
         $i2 = $end   if $i2 > $end;
+        next if $i2 < $i1;
 
         my $x1 = $x_of->($i1 - $start);
         my $x2 = $x_of->($i2 - $start);
@@ -822,6 +844,103 @@ sub _draw_daily_proximity {
             -font   => ['Arial', 7, 'italic'],
             -tags   => 'smc_daily',
         );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_strong_weak — Strong/Weak High/Low (LuxAlgo drawHighLowSwings()).
+# Línea horizontal desde el índice del extremo hasta el borde derecho, con la
+# etiqueta que depende de la tendencia swing vigente (swing_trend):
+#   máximo -> 'Strong High' (trend bajista, rojo) | 'Weak High' (alcista)
+#   mínimo -> 'Strong Low'  (trend alcista, verde) | 'Weak Low'  (bajista)
+# Colores: alto en rojo (#ef5350), bajo en verde (#26a69a) — igual que LuxAlgo
+# (topLine=swingBearishColor, bottomLine=swingBullishColor).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _draw_strong_weak {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    my $sw = $smc->strong_weak();
+    return unless $sw;
+    my $trend = $smc->swing_trend();   # 'up' | 'down' | 'unknown'
+    my $right = $state->{right} // $x_of->($end - $start);
+
+    # top: 'Strong High' si la tendencia swing es bajista, 'Weak High' si alcista
+    for my $spec (
+        [ $sw->{top},    '#ef5350', ($trend eq 'down' ? 'Strong High' : 'Weak High'), -8 ],
+        [ $sw->{bottom}, '#26a69a', ($trend eq 'up'   ? 'Strong Low'  : 'Weak Low'),  +8 ],
+    ) {
+        my ($ext, $color, $label, $dy) = @$spec;
+        next unless $ext && defined $ext->{price};
+        my $y = $self->{scale}->price_to_y($ext->{price}, $min, $max, $top, $h);
+        next if $y < $top || $y > $top + $h;
+
+        # Ancla izquierda: el índice del extremo si es visible, si no el borde izq.
+        my $fi = (defined $ext->{index} && $ext->{index} > $start) ? $ext->{index} : $start;
+        my $x1 = $x_of->($fi - $start);
+
+        $canvas->createLine($x1, $y, $right, $y,
+            -fill  => $color,
+            -width => 1,
+            -tags  => 'smc_strongweak',
+        );
+        $canvas->createText($right - 4, $y + $dy,
+            -anchor => 'e',
+            -text   => $label,
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'smc_strongweak',
+        );
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _draw_mtf_levels — niveles Highs & Lows MTF (LuxAlgo drawLevels()). Por cada
+# temporalidad activa (D/W/M) dibuja el high y el low del período ANTERIOR ya
+# cerrado como líneas horizontales de ancho visible, con labels PDH/PDL,
+# PWH/PWL, PMH/PML. Color azul (#2157f3), sólidas — igual que LuxAlgo (BLUE).
+# Los datos ya vienen acotados al cursor desde el indicador (replay-safe).
+# ─────────────────────────────────────────────────────────────────────────────
+my $COLOR_MTF = '#2157f3';
+
+sub _draw_mtf_levels {
+    my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
+
+    my $levels = $smc->mtf_levels();
+    return unless $levels;
+
+    my $left  = $state->{left}  // $x_of->(0);
+    my $right = $state->{right} // $x_of->($end - $start);
+
+    my @specs = (
+        [ 'mtf_d', 'D', 'PDH', 'PDL' ],
+        [ 'mtf_w', 'W', 'PWH', 'PWL' ],
+        [ 'mtf_m', 'M', 'PMH', 'PML' ],
+    );
+    for my $s (@specs) {
+        my ($key, $tf, $htag, $ltag) = @$s;
+        next unless $self->{visible}{$key};
+        my $lv = $levels->{$tf};
+        next unless $lv;
+
+        for my $pair ([ $lv->{ph}, $htag ], [ $lv->{pl}, $ltag ]) {
+            my ($price, $tag) = @$pair;
+            next unless defined $price;
+            my $y = $self->{scale}->price_to_y($price, $min, $max, $top, $h);
+            next if $y < $top || $y > $top + $h;
+
+            $canvas->createLine($left, $y, $right, $y,
+                -fill  => $COLOR_MTF,
+                -width => 1,
+                -tags  => 'smc_mtf',
+            );
+            $canvas->createText($right - 4, $y - 6,
+                -anchor => 'e',
+                -text   => $tag,
+                -fill   => $COLOR_MTF,
+                -font   => ['Arial', 7, 'bold'],
+                -tags   => 'smc_mtf',
+            );
+        }
     }
 }
 

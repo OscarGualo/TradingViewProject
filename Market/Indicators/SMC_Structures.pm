@@ -192,6 +192,10 @@ sub _offset_indices {
         $fib->{from}{index} += $base;
         $fib->{to}{index}   += $base;
     }
+    if (my $sw = $self->{strong_weak}) {
+        $sw->{top}{index}    += $base if $sw->{top}    && defined $sw->{top}{index};
+        $sw->{bottom}{index} += $base if $sw->{bottom} && defined $sw->{bottom}{index};
+    }
 
     # Reconstruir los índices O(1) por vela
     $self->{swings_by_index} = {};
@@ -229,6 +233,11 @@ sub reset {
     $self->{trendlines} = [];
     $self->{daily_proximity} = undef;
     $self->{fibonacci} = [];
+    $self->{strong_weak} = undef;
+    $self->{mtf_levels} = undef;
+    # swing_trend NO se limpia aquí: lo fija _detect_bos_choch_pass en cada
+    # cálculo (scope external). Si aún no corrió, swing_trend() devuelve
+    # 'unknown' por el // en el accessor.
     # NOTA: reset() NO toca _fvg_global / _fvg_last_global_index a propósito
     # — ese es el estado persistente que hace posible la actualización
     # incremental de FVG (spec del profesor: "no debe recalcular todo el
@@ -335,6 +344,25 @@ sub daily_proximity {
 sub values_fibonacci {
     my ($self) = @_;
     return $self->{fibonacci};
+}
+
+# Strong/Weak High/Low (trailing extremes) — { top=>{price,index}, bottom=>{...} }
+sub strong_weak {
+    my ($self) = @_;
+    return $self->{strong_weak};
+}
+
+# Tendencia swing (externa) vigente en el cursor: 'up' | 'down' | 'unknown'.
+# La usa el overlay para decidir Strong vs Weak en cada extremo.
+sub swing_trend {
+    my ($self) = @_;
+    return $self->{swing_trend} // 'unknown';
+}
+
+# Niveles MTF (prev D/W/M high-low) — { D=>{ph,pl}, W=>{...}, M=>{...} }
+sub mtf_levels {
+    my ($self) = @_;
+    return $self->{mtf_levels};
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,6 +563,17 @@ sub calculate_all {
     #    ventana (mismo espacio que tenían los índices al calcular
     #    directamente sobre $data, antes de este fix).
     $self->_trim_warmup($warmup_n) if $warmup_n;
+
+    # ── Paso 9: Strong/Weak High/Low (trailing extremes estilo LuxAlgo). Se
+    #    calcula DESPUÉS del trim para operar en el espacio LOCAL de la ventana
+    #    ($data y major_swings ya alineados); _offset_indices() al final lo
+    #    lleva a índices globales.
+    $self->_calc_strong_weak($data);
+
+    # ── Paso 10: MTF Levels (high/low del período D/W/M anterior). Sólo
+    #    almacena precios (líneas horizontales), no requiere reindexado;
+    #    get_tf_data() ya se acota al cursor en los proxies de replay.
+    $self->_calc_mtf_levels($market_data);
 
     # Ordenar trendlines por point1.index para habilitar búsqueda binaria
     @{ $self->{trendlines} } = sort { $a->{point1}{index} <=> $b->{point1}{index} }
@@ -749,6 +788,14 @@ sub _detect_bos_choch_pass {
         $prev_body_high = $body_high;
         $prev_body_low  = $body_low;
     }
+
+    # Persistir la tendencia final del scope EXTERNO (swing) — es la tendencia
+    # vigente en la última vela procesada (= el cursor/borde derecho). La usa
+    # Strong/Weak High/Low: un máximo es "Strong High" cuando la tendencia
+    # swing es bajista (el precio se alejó de él a la baja) y "Weak High"
+    # cuando es alcista; simétrico para el mínimo. Igual que LuxAlgo
+    # (swingTrend.bias). 'unknown' se mapea luego a 'up' por defecto neutro.
+    $self->{swing_trend} = $trend if $scope eq 'external';
 }
 
 
@@ -1098,53 +1145,95 @@ sub _calc_atr_simple {
 sub _detect_order_blocks {
     my ($self, $data) = @_;
     my $n = scalar @$data;
+    return if $n < 2;
 
+    # ── Refactor a "Internal Order Blocks" estilo LuxAlgo ─────────────────────
+    # El usuario pidió replicar la config LuxAlgo (Internal Order Blocks ON, 5
+    # más recientes). LuxAlgo genera un OB por CADA ruptura de estructura
+    # INTERNA (BOS y CHoCH), no la "última vela opuesta". El ruido que
+    # preocupaba al profesor se controla con el cap de N=5 más recientes en el
+    # overlay — el mismo mecanismo que usa LuxAlgo (internalOrderBlocksSizeInput).
+
+    # Paso 1: ATR(200) RMA (== ta.atr(200) de LuxAlgo) para clasificar velas de
+    # alta volatilidad.
+    my $P = 200;
+    my (@atr);
+    my ($rma, $prev_close);
+    for my $i (0 .. $n - 1) {
+        my $c = $data->[$i];
+        my $tr = $i == 0
+            ? ($c->{high} - $c->{low})
+            : do { my $a = $c->{high} - $c->{low};
+                   my $b = abs($c->{high} - $prev_close);
+                   my $d = abs($c->{low}  - $prev_close);
+                   my $m = $a; $m = $b if $b > $m; $m = $d if $d > $m; $m };
+        $rma = $i == 0 ? $tr : ($rma * ($P - 1) + $tr) / $P;
+        $atr[$i]    = $rma;
+        $prev_close = $c->{close};
+    }
+
+    # Paso 2: parsedHigh/parsedLow — en velas de ALTA volatilidad LuxAlgo
+    # intercambia high<->low, para que el OB no se ancle a la mecha extrema del
+    # impulso (highVolatilityBar = (high-low) >= 2*ATR).
+    my (@ph, @pl);
+    for my $i (0 .. $n - 1) {
+        my $c  = $data->[$i];
+        my $hv = ($c->{high} - $c->{low}) >= 2 * $atr[$i];
+        $ph[$i] = $hv ? $c->{low}  : $c->{high};
+        $pl[$i] = $hv ? $c->{high} : $c->{low};
+    }
+
+    # Paso 3: un OB por ruptura de estructura INTERNA (BOS + CHoCH). Bullish ->
+    # bar con MIN parsedLow (demanda); bearish -> bar con MAX parsedHigh (oferta),
+    # dentro de [level_index, event_index) — idéntico a storeOrdeBlock().
+    my @obs;
     for my $ev (@{ $self->{events} }) {
-        next unless $ev->{type} eq 'BOS';
-        next unless $ev->{scope} eq 'external';   # FIX: solo estructura externa
+        next unless $ev->{scope} eq 'internal';
+        my $a = $ev->{level_index};
+        my $b = $ev->{index};
+        next if !defined $a;
+        $a = 0 if $a < 0;
+        next if $b <= $a;
 
-        my $is_bullish_bos = ($ev->{direction} eq 'up');
-        my $search_start    = $ev->{level_index};
-        my $search_end      = $ev->{index};
-        next if $search_end <= $search_start;
-
-        # Buscar hacia atrás desde el evento la última vela de dirección opuesta
-        my $ob_index;
-        for (my $j = $search_end - 1; $j >= $search_start; $j--) {
-            my $c = $data->[$j];
-            my $is_opposite = $is_bullish_bos
-                ? ($c->{close} < $c->{open})    # vela bajista para OB alcista
-                : ($c->{close} > $c->{open});   # vela alcista para OB bajista
-            if ($is_opposite) {
-                $ob_index = $j;
-                last;
-            }
+        my $bullish = ($ev->{direction} eq 'up');
+        my $sel = $a;
+        if ($bullish) {
+            my $best = $pl[$a];
+            for my $j ($a .. $b - 1) { if ($pl[$j] < $best) { $best = $pl[$j]; $sel = $j; } }
+        } else {
+            my $best = $ph[$a];
+            for my $j ($a .. $b - 1) { if ($ph[$j] > $best) { $best = $ph[$j]; $sel = $j; } }
         }
-        next unless defined $ob_index;
 
-        my $ob_candle = $data->[$ob_index];
-        my $ob = {
-            index        => $ob_index,
-            direction    => $is_bullish_bos ? 'bullish' : 'bearish',
-            top          => $ob_candle->{high},
-            bottom       => $ob_candle->{low},
-            bos_index    => $ev->{index},
+        my $top    = $ph[$sel] > $pl[$sel] ? $ph[$sel] : $pl[$sel];
+        my $bottom = $ph[$sel] > $pl[$sel] ? $pl[$sel] : $ph[$sel];
+
+        push @obs, {
+            index        => $sel,
+            direction    => $bullish ? 'bullish' : 'bearish',
+            top          => $top,
+            bottom       => $bottom,
+            bos_index    => $b,
             mitigated_at => undef,
         };
-
-        # Buscar mitigación: primera vela posterior al BOS que vuelve a
-        # tocar el rango del Order Block.
-        for (my $j = $ev->{index} + 1; $j < $n; $j++) {
-            my $c = $data->[$j];
-            if ($c->{low} <= $ob->{top} && $c->{high} >= $ob->{bottom}) {
-                $ob->{mitigated_at} = $j;
-                last;
-            }
-        }
-
-        push @{ $self->{order_blocks} }, $ob;
-        $self->{order_blocks_by_index}{$ob_index} = $ob;
     }
+
+    # Paso 4: mitigación estilo LuxAlgo (deleteOrderBlocks): bearish se mitiga
+    # cuando high > OB.top; bullish cuando low < OB.bottom (el precio ATRAVIESA
+    # el bloque). Se busca a partir de la vela siguiente a la ruptura.
+    for my $ob (@obs) {
+        for (my $j = $ob->{bos_index} + 1; $j < $n; $j++) {
+            my $c = $data->[$j];
+            my $crossed = $ob->{direction} eq 'bearish'
+                ? ($c->{high} > $ob->{top})
+                : ($c->{low}  < $ob->{bottom});
+            if ($crossed) { $ob->{mitigated_at} = $j; last; }
+        }
+    }
+
+    @{ $self->{order_blocks} } = @obs;
+    $self->{order_blocks_by_index} = {};
+    $self->{order_blocks_by_index}{ $_->{index} } = $_ for @obs;
 }
 
 
@@ -1389,6 +1478,74 @@ sub _calc_daily_proximity {
         zone              => $zone,
         distance_to_body  => $distance_to_body,
     };
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _calc_strong_weak — Strong/Weak High/Low (trailing extremes estilo LuxAlgo,
+# drawHighLowSwings()). trailing.top = máximo high desde el ÚLTIMO swing high
+# mayor hasta el borde; trailing.bottom = mínimo low desde el último swing low
+# mayor. La semántica Strong/Weak la resuelve el overlay con swing_trend():
+#   máximo -> 'Strong High' si trend swing bajista, 'Weak High' si alcista
+#   mínimo -> 'Strong Low'  si trend swing alcista, 'Weak Low'  si bajista
+#
+# Causal: corre sobre $data (la ventana/proxy) con índices LOCALES; el
+# _offset_indices($base) final los lleva a globales. Replay-safe por
+# construcción (nunca mira más allá de la última vela de $data = el cursor).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _calc_strong_weak {
+    my ($self, $data) = @_;
+    $self->{strong_weak} = undef;
+    my $n = scalar @$data;
+    return if $n < 1;
+
+    # Último swing high y último swing low de la estructura MAYOR (swing).
+    my ($last_high, $last_low);
+    for my $sw (@{ $self->{major_swings} }) {
+        if    ($sw->{type} eq 'high') { $last_high = $sw; }
+        elsif ($sw->{type} eq 'low')  { $last_low  = $sw; }
+    }
+
+    # Ancla: el índice del último swing del tipo, acotado a la ventana. Si no
+    # hay swing de ese tipo en la ventana, se arranca desde el inicio visible.
+    my $from_hi = defined $last_high ? $last_high->{index} : 0;
+    my $from_lo = defined $last_low  ? $last_low->{index}  : 0;
+    $from_hi = 0 if $from_hi < 0; $from_hi = $n - 1 if $from_hi > $n - 1;
+    $from_lo = 0 if $from_lo < 0; $from_lo = $n - 1 if $from_lo > $n - 1;
+
+    my ($top_price, $top_idx) = ($data->[$from_hi]{high}, $from_hi);
+    for my $i ($from_hi .. $n - 1) {
+        if ($data->[$i]{high} >= $top_price) { $top_price = $data->[$i]{high}; $top_idx = $i; }
+    }
+    my ($bot_price, $bot_idx) = ($data->[$from_lo]{low}, $from_lo);
+    for my $i ($from_lo .. $n - 1) {
+        if ($data->[$i]{low} <= $bot_price) { $bot_price = $data->[$i]{low}; $bot_idx = $i; }
+    }
+
+    $self->{strong_weak} = {
+        top    => { price => $top_price, index => $top_idx },
+        bottom => { price => $bot_price, index => $bot_idx },
+    };
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _calc_mtf_levels — niveles Highs & Lows MTF (drawLevels() de LuxAlgo): high y
+# low del período HTF ANTERIOR ya cerrado, para D / W / M. Se dibujan como
+# líneas horizontales (PDH/PDL, PWH/PWL, PMH/PML). Sólo precios: no requiere
+# reindexado. get_tf_data() ya se acota al cursor en los proxies de replay
+# (WindowProxy/ReplayProxy delegan a get_tf_data_upto), así que la penúltima
+# vela = período anterior ya cerrado respecto al cursor. 'M' puede no existir
+# si MarketData no construyó mensual — se ignora sin error.
+# ─────────────────────────────────────────────────────────────────────────────
+sub _calc_mtf_levels {
+    my ($self, $md) = @_;
+    my %out;
+    for my $tf ('D', 'W', 'M') {
+        my $arr = eval { $md->get_tf_data($tf) };
+        next unless $arr && @$arr >= 2;
+        my $prev = $arr->[-2];   # período anterior completo (LuxAlgo: high[1]/low[1])
+        $out{$tf} = { ph => $prev->{high}, pl => $prev->{low} };
+    }
+    $self->{mtf_levels} = \%out;
 }
 
 # Helper interno: registra un evento BOS/CHoCH en las dos estructuras de

@@ -2,16 +2,36 @@ package Market::MarketData;
 use strict;
 use warnings;
 use Time::Piece;
+use Time::Local qw(timegm);
 
-# Temporalidades soportadas (en minutos). 'D' y 'W' se manejan con lógica especial.
-our @SUPPORTED_TF = (1, 5, 15, 60, 120, 240, 'D', 'W');
+# Temporalidades soportadas (en minutos). 'D', 'W' y 'M' se manejan con lógica
+# especial. 'M' (mensual) usa bucketing de CALENDARIO (mes real), no minutos
+# fijos — un mes no tiene una duración constante en minutos.
+our @SUPPORTED_TF = (1, 5, 15, 60, 120, 240, 'D', 'W', 'M');
 
-# Minutos por temporalidad (para las especiales D=1440, W=10080)
+# Minutos por temporalidad (para las especiales D=1440, W=10080). 'M' NO está
+# aquí a propósito: se calcula por calendario en _bucket_epoch/_bucket_end_epoch.
 my %TF_MINUTES = (
     1 => 1, 5 => 5, 15 => 15,
     60 => 60, 120 => 120, 240 => 240,
     'D' => 1440, 'W' => 10080,
 );
+
+# Inicio (epoch UTC) del mes calendario que contiene a $epoch.
+sub _month_start_epoch {
+    my ($epoch) = @_;
+    my ($y, $mon) = (CORE::gmtime($epoch))[5, 4];   # year-1900, mon 0-11
+    return timegm(0, 0, 0, 1, $mon, $y + 1900);
+}
+
+# Inicio (epoch UTC) del mes siguiente al que contiene a $epoch.
+sub _next_month_start_epoch {
+    my ($epoch) = @_;
+    my ($y, $mon) = (CORE::gmtime($epoch))[5, 4];
+    $mon++;
+    if ($mon > 11) { $mon = 0; $y++; }
+    return timegm(0, 0, 0, 1, $mon, $y + 1900);
+}
 
 sub new {
     my ($class) = @_;
@@ -108,12 +128,22 @@ sub _to_epoch {
 }
 
 # Devuelve el epoch del inicio del bucket para un TF dado.
-# Para D y W se alinea al inicio del día/semana UTC.
+# Para D y W se alinea al inicio del día/semana UTC; para M al inicio de mes.
 sub _bucket_epoch {
     my ($epoch, $tf) = @_;
+    return _month_start_epoch($epoch) if $tf eq 'M';
     my $minutes = $TF_MINUTES{$tf} // ($tf + 0);
     my $seconds = $minutes * 60;
     return int($epoch / $seconds) * $seconds;
+}
+
+# Fin (epoch UTC, exclusivo) del bucket que empieza en $bucket_start para $tf.
+# Para M es el inicio del mes siguiente; para el resto, inicio + duración fija.
+sub _bucket_end_epoch {
+    my ($bucket_start, $tf) = @_;
+    return _next_month_start_epoch($bucket_start) if $tf eq 'M';
+    my $minutes = $TF_MINUTES{$tf} // ($tf + 0);
+    return $bucket_start + $minutes * 60;
 }
 
 # Construye (o reconstruye) el array de velas para un TF a partir de las velas 1m.
@@ -263,9 +293,8 @@ sub get_tf_data_upto {
     # ¿El último bucket devuelto sigue "en formación" en el instante del
     # cursor (todavía no llegó a bucket_start + duración)? Si es así, hay
     # que reconstruirlo solo con los 1m ya "sucedidos".
-    my $minutes      = $TF_MINUTES{$tf} // ($tf + 0);
     my $bucket_start = $out[-1]{epoch};
-    my $bucket_end   = $bucket_start + $minutes * 60;
+    my $bucket_end   = _bucket_end_epoch($bucket_start, $tf);
 
     if ($cursor_epoch < $bucket_end - 1) {
         my $m1 = $self->{data}{1};
