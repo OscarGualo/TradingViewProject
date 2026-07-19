@@ -14,6 +14,7 @@ use Market::Overlays::Liquidity;
 use Market::Indicators::ZigZagMTF;
 use Market::Indicators::ZigZagVolume;
 use Market::Overlays::ZigZag;
+use Market::Overlays::VWAP;
 
 sub new {
     my ($class, %args) = @_;
@@ -38,6 +39,9 @@ sub new {
         smc_overlay => Market::Overlays::SMC_Structures->new(),
         liq_overlay => Market::Overlays::Liquidity->new(),
         zz_overlay  => Market::Overlays::ZigZag->new(),
+        vwap_overlay => Market::Overlays::VWAP->new(),
+        # AVWAP: modo de selección de anchor por clic (como el replay pick).
+        avwap_picking => 0,
 
         # ── Estado del sistema Replay (Fase 2) ───────────────────────────────
         # replay_mode   : 0 = normal, 1 = en modo replay activo
@@ -355,6 +359,39 @@ sub run {
         $_refresh_zz_res_btns->($k);
     }
 
+    # ── AVWAP (Anchored VWAP) ────────────────────────────────────────────────
+    my %vwap_var = (vwap => 1, band1 => 1, band2 => 1, band3 => 0);
+    my %vwap_label = (vwap => 'VWAP', band1 => 'Banda 1σ', band2 => 'Banda 2σ', band3 => 'Banda 3σ');
+    my @vwap_order = qw(vwap band1 band2 band3);
+    my $vwap_box = $ov_win->Frame(-background => '#1e222d')
+        ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
+    $vwap_box->Label(-text => 'AVWAP', -background => '#1e222d',
+        -foreground => '#5b9cff', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
+    # Botón "Anclar" (entra al modo clic-para-anclar)
+    $vwap_box->Button(
+        -text => 'Anclar (clic en vela)', -relief => 'flat', -borderwidth => 0,
+        -padx => 8, -pady => 3, -font => ['Arial', 8, 'bold'],
+        -foreground => '#ffffff', -background => '#2962ff',
+        -activeforeground => '#ffffff', -activebackground => '#1a47cc', -cursor => 'hand2',
+        -command => sub { $ov_win->withdraw(); $self->avwap_enter_pick(); },
+    )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 4]);
+    for my $key (@vwap_order) {
+        my $k = $key;
+        $vwap_box->Checkbutton(
+            -text     => $vwap_label{$k},
+            -variable => \$vwap_var{$k},
+            -onvalue  => 1, -offvalue => 0,
+            -command  => sub {
+                $self->{vwap_overlay}->set_visible($k, $vwap_var{$k});
+                $self->draw();
+            },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#2962ff', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
     my $overlays_btn = $top->Button(
         -text             => 'Overlays',
         -relief           => 'flat',
@@ -382,6 +419,18 @@ sub run {
     $overlays_btn->pack(-side => 'left', -padx => 2);
     $self->{_overlays_btn} = $overlays_btn;
     $self->{_ov_win} = $ov_win;
+
+    # ── Botón AVWAP: entra al modo "clic para anclar" (como el replay pick) ──
+    my $avwap_btn = $top->Button(
+        -text => 'VWAP Anclado', -relief => 'flat', -borderwidth => 0,
+        -padx => 12, -pady => 5, -font => ['Arial', 9, 'bold'],
+        -foreground => '#b2b5be', -background => '#1e222d',
+        -activeforeground => '#ffffff', -activebackground => '#2a2e39',
+        -cursor => 'hand2',
+    );
+    $avwap_btn->configure(-command => sub { $self->avwap_enter_pick(); });
+    $avwap_btn->pack(-side => 'left', -padx => 2);
+    $self->{_avwap_btn} = $avwap_btn;
 
 
 
@@ -601,7 +650,8 @@ $canvas->Tk::bind('<MouseWheel>' => [
     $mw->Tk::bind('<plus>'  => sub { $self->mouse_wheel(120); });
     $mw->Tk::bind('<minus>' => sub { $self->mouse_wheel(-120); });
     $mw->Tk::bind('<Escape>' => sub {
-        if ($self->{replay_picking}) { $self->replay_cancel_pick(); }
+        if    ($self->{avwap_picking}) { $self->avwap_cancel_pick(); }
+        elsif ($self->{replay_picking}) { $self->replay_cancel_pick(); }
         elsif ($self->{replay_mode}) { $self->replay_exit(); }
         else                         { $mw->destroy; }
     });
@@ -614,7 +664,8 @@ $canvas->Tk::bind('<MouseWheel>' => [
     # Se duplica aquí el mismo bind directamente sobre $canvas para que
     # Escape funcione sin importar qué widget tenga el foco en ese momento.
     $canvas->Tk::bind('<Escape>' => sub {
-        if ($self->{replay_picking}) { $self->replay_cancel_pick(); }
+        if    ($self->{avwap_picking}) { $self->avwap_cancel_pick(); }
+        elsif ($self->{replay_picking}) { $self->replay_cancel_pick(); }
         elsif ($self->{replay_mode}) { $self->replay_exit(); }
         else                         { $mw->destroy; }
     });
@@ -995,6 +1046,68 @@ sub _replay_recalc_indicators {
 
     my $zzv = $ind->get_indicator('ZigZagVolume');
     $zzv->calculate_all($wproxy) if defined $zzv;
+
+    # AVWAP: acumulativo desde un anchor fijo — NO usa el WindowProxy deslizante
+    # (perdería el anchor). Se recalcula con historia completa acotada al cursor.
+    $self->_recalc_avwap();
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANCHORED VWAP — selección de anchor por clic y recálculo
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Recalcula el AVWAP respetando el modo Replay. Como es acumulativo desde un
+# anchor FIJO, no puede usar el WindowProxy deslizante (perdería el anchor):
+# en Replay usa un ReplayProxy (historia completa acotada al cursor).
+sub _recalc_avwap {
+    my ($self) = @_;
+    my $v = $self->{indicators}->get_indicator('VWAP');
+    return unless defined $v;
+    if ($self->{replay_mode}) {
+        $v->calculate_all(Market::ReplayProxy->new($self->{market}, $self->{replay_cursor}));
+    } else {
+        $v->calculate_all($self->{market});
+    }
+}
+
+# Entra al modo de selección de anchor: el próximo clic en una vela fija el
+# punto de anclaje del AVWAP (igual patrón que el replay pick).
+sub avwap_enter_pick {
+    my ($self) = @_;
+    return if $self->{avwap_picking};
+    $self->{avwap_picking} = 1;
+    $self->{canvas}->configure(-cursor => 'sb_h_double_arrow') if $self->{canvas};
+    $self->{_avwap_btn}->configure(-text => '[ Clic para anclar ]',
+        -foreground => '#f0b90b', -background => '#2a1a00') if $self->{_avwap_btn};
+    $self->draw();
+}
+
+sub avwap_cancel_pick {
+    my ($self) = @_;
+    return unless $self->{avwap_picking};
+    $self->{avwap_picking} = 0;
+    $self->{canvas}->configure(-cursor => 'crosshair') if $self->{canvas};
+    $self->_avwap_reset_btn();
+    $self->draw();
+}
+
+sub _avwap_reset_btn {
+    my ($self) = @_;
+    $self->{_avwap_btn}->configure(-text => 'VWAP Anclado',
+        -foreground => '#b2b5be', -background => '#1e222d') if $self->{_avwap_btn};
+}
+
+# Fija el anchor en el índice dado, recalcula y redibuja.
+sub set_avwap_anchor {
+    my ($self, $idx) = @_;
+    $self->{avwap_picking} = 0;
+    $self->{canvas}->configure(-cursor => 'crosshair') if $self->{canvas};
+    $self->_avwap_reset_btn();
+    my $v = $self->{indicators}->get_indicator('VWAP');
+    return unless defined $v;
+    $v->set_anchor($idx);
+    $self->_recalc_avwap();
+    $self->draw();
 }
 
 # 1.2: cambia en caliente la temporalidad de referencia de ZigZagMTF/ZigZagVolume
@@ -1095,6 +1208,15 @@ sub set_timeframe {
         $old_cursor_epoch = $c->{epoch} if defined $c;
     }
 
+    # AVWAP: el anchor es un índice de la TF ANTERIOR. Guardar su epoch para
+    # reproyectarlo a la TF nueva (que se mantenga en la MISMA vela real).
+    my $old_anchor_epoch;
+    my $vwap_ind = $self->{indicators}->get_indicator('VWAP');
+    if (defined $vwap_ind && $vwap_ind->has_anchor) {
+        my $ac = $self->{market}->get_candle($vwap_ind->anchor_index);
+        $old_anchor_epoch = $ac->{epoch} if defined $ac;
+    }
+
     $self->{tf} = $tf;
     $self->{market}->set_timeframe($tf);
     $self->{indicators}->reset_all();
@@ -1115,6 +1237,13 @@ sub set_timeframe {
     # recalcula igual que antes.
     my $atr = $self->{indicators}->get_indicator('ATR');
     $atr->calculate_all($self->{market}) if defined $atr;
+
+    # AVWAP: reproyectar el anchor a la nueva TF por epoch (reset_all() ya
+    # limpió sus points pero conservó anchor_index).
+    if (defined $vwap_ind && defined $old_anchor_epoch) {
+        my $new_a = $self->{market}->index_at_epoch($old_anchor_epoch);
+        $vwap_ind->set_anchor($new_a >= 0 ? $new_a : 0);
+    }
 
     if ($self->{replay_mode}) {
         # Reproyectar el cursor a la nueva TF por epoch.
@@ -1298,6 +1427,9 @@ sub draw {
     my $zzv_ind = $self->{indicators}->get_indicator('ZigZagVolume');
     $self->{zz_overlay}->draw($c, $zzm_ind, $zzv_ind, $x_of, \%state);
 
+    my $vwap_ind = $self->{indicators}->get_indicator('VWAP');
+    $self->{vwap_overlay}->draw($c, $vwap_ind, $x_of, \%state) if defined $vwap_ind;
+
     # Limpia el área del ATR para ocultar cualquier vela/volumen que se haya pasado.
     $c->createRectangle(
         $self->{left}, $atr_top,
@@ -1328,7 +1460,7 @@ $self->{atr_panel}->draw($c, $atr, $x_of, \%state);
     #    (representa las velas "futuras" que quedarán ocultas)
     # 2. Línea vertical amarilla punteada siguiendo al mouse
     # 3. Etiqueta con la fecha/hora de la vela bajo el cursor
-    if ($self->{replay_picking} && defined $self->{replay_pick_index}) {
+    if (($self->{replay_picking} || $self->{avwap_picking}) && defined $self->{replay_pick_index}) {
         my $pick = $self->{replay_pick_index};
         if ($pick >= $start && $pick <= $end) {
             my $local_i = $pick - $start;
@@ -1763,6 +1895,13 @@ sub mouse_move {
         return;
     }
 
+    # Preview del anchor del AVWAP: reutiliza la línea de corte del replay pick.
+    if ($self->{avwap_picking}) {
+        $self->{replay_pick_index} = $idx;
+        $self->draw();
+        return;
+    }
+
     $self->_draw_crosshair_only();
     return;
 }
@@ -1788,6 +1927,14 @@ sub x_to_index {
 sub mouse_down {
     my ($self, $x, $y) = @_;
     my ($w, $h, $right, $atr_top) = $self->layout();
+
+    # ── Modo selección de anchor del AVWAP (clic sobre una vela) ─────────────
+    if ($self->{avwap_picking}) {
+        if ($x >= $self->{left} && $x < $right && $y < $h - $self->{bottom_h}) {
+            $self->set_avwap_anchor($self->x_to_index($x));
+        }
+        return;   # consumir el evento
+    }
 
     # ── Modo selección de punto Replay (2.3-A) ───────────────────────────────
     # Si estamos en modo "picking", cualquier clic en el área de precio o ATR

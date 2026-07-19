@@ -12,6 +12,7 @@ use Market::Indicators::SMC_Structures;
 use Market::Indicators::Liquidity;
 use Market::Indicators::ZigZagMTF;
 use Market::Indicators::ZigZagVolume;
+use Market::Indicators::VWAP;
 use Market::ChartEngine;
 
 # ─── Resolución de archivos CSV ──────────────────────────────────────────────
@@ -92,6 +93,9 @@ $indicators->register('SMC_Structures', Market::Indicators::SMC_Structures->new(
 $indicators->register('Liquidity', Market::Indicators::Liquidity->new(depth => 3));
 $indicators->register('ZigZagMTF',    Market::Indicators::ZigZagMTF->new());
 $indicators->register('ZigZagVolume', Market::Indicators::ZigZagVolume->new());
+# Anchored VWAP — arranca SIN anchor (no dibuja nada hasta que el usuario
+# hace clic con el botón "VWAP Anclado").
+$indicators->register('VWAP', Market::Indicators::VWAP->new());
 $indicators->update_last($market);
 
 $loading->destroy;
