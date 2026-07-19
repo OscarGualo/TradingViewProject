@@ -15,6 +15,7 @@ use Market::Indicators::ZigZagMTF;
 use Market::Indicators::ZigZagVolume;
 use Market::Overlays::ZigZag;
 use Market::Overlays::VWAP;
+use Market::Overlays::VolumeProfile;
 
 sub new {
     my ($class, %args) = @_;
@@ -46,6 +47,10 @@ sub new {
         avwap_types   => {                  # anclajes automáticos activos
             session => 0, open => 0, bos => 0, choch => 0, poc => 0,
         },
+        # AVP — Perfil de Volumen Anclado multipivot (fiel a TradingView):
+        avp_overlay => Market::Overlays::VolumeProfile->new(),
+        avp_picking => 0,                   # modo "clic para anclar" (manual)
+        avp_manual  => [],                  # lista de índices globales anclados a mano
 
         # ── Estado del sistema Replay (Fase 2) ───────────────────────────────
         # replay_mode   : 0 = normal, 1 = en modo replay activo
@@ -419,6 +424,59 @@ sub run {
         )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
     }
 
+    # ── AVP (Perfil de Volumen Anclado) ──────────────────────────────────────
+    my $avp_box = $ov_win->Frame(-background => '#1e222d')
+        ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
+    $avp_box->Label(-text => 'Volume Profile', -background => '#1e222d',
+        -foreground => '#22d3ee', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
+    $avp_box->Button(
+        -text => 'Anclar (clic en vela)', -relief => 'flat', -borderwidth => 0,
+        -padx => 8, -pady => 3, -font => ['Arial', 8, 'bold'],
+        -foreground => '#ffffff', -background => '#0e7490',
+        -activeforeground => '#ffffff', -activebackground => '#0a5566', -cursor => 'hand2',
+        -command => sub { $ov_win->withdraw(); $self->avp_enter_pick(); },
+    )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 2]);
+    $avp_box->Button(
+        -text => 'Limpiar', -relief => 'flat', -borderwidth => 0,
+        -padx => 8, -pady => 2, -font => ['Arial', 8, 'bold'],
+        -foreground => '#b2b5be', -background => '#2a2e39',
+        -activeforeground => '#ffffff', -activebackground => '#3a3e49', -cursor => 'hand2',
+        -command => sub { $self->avp_clear(); },
+    )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 6]);
+
+    # Modo de volumen: Máx/Mín (updown) | Total | Delta.
+    $avp_box->Label(-text => 'Volumen:', -background => '#1e222d',
+        -foreground => '#787b86', -font => ['Arial', 8])
+        ->pack(-side => 'top', -anchor => 'w');
+    my $avp_mode = 'updown';
+    my %avp_mode_lbl = (updown => 'Máx/Mín', total => 'Total', delta => 'Delta');
+    for my $m (qw(updown total delta)) {
+        my $mm = $m;
+        $avp_box->Radiobutton(
+            -text => $avp_mode_lbl{$m}, -value => $m, -variable => \$avp_mode,
+            -command => sub { $self->avp_set_mode($mm); },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#22d3ee', -font => ['Arial', 8], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
+    # Mostrar/ocultar POC / VAH / VAL.
+    my %avp_vis = (poc => 1, vah => 1, val => 1);
+    my %avp_vis_lbl = (poc => 'POC', vah => 'VAH', val => 'VAL');
+    for my $key (qw(poc vah val)) {
+        my $k = $key;
+        $avp_box->Checkbutton(
+            -text => $avp_vis_lbl{$k}, -variable => \$avp_vis{$k},
+            -onvalue => 1, -offvalue => 0,
+            -command => sub { $self->avp_toggle_visible($k, $avp_vis{$k}); },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#e53935', -font => ['Arial', 8], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
     my $overlays_btn = $top->Button(
         -text             => 'Overlays',
         -relief           => 'flat',
@@ -458,6 +516,18 @@ sub run {
     $avwap_btn->configure(-command => sub { $self->avwap_enter_pick(); });
     $avwap_btn->pack(-side => 'left', -padx => 2);
     $self->{_avwap_btn} = $avwap_btn;
+
+    # ── Botón AVP: entra al modo "clic para anclar" el Perfil de Volumen ─────
+    my $avp_btn = $top->Button(
+        -text => 'Perfil Volumen', -relief => 'flat', -borderwidth => 0,
+        -padx => 12, -pady => 5, -font => ['Arial', 9, 'bold'],
+        -foreground => '#b2b5be', -background => '#1e222d',
+        -activeforeground => '#ffffff', -activebackground => '#2a2e39',
+        -cursor => 'hand2',
+    );
+    $avp_btn->configure(-command => sub { $self->avp_enter_pick(); });
+    $avp_btn->pack(-side => 'left', -padx => 2);
+    $self->{_avp_btn} = $avp_btn;
 
 
 
@@ -678,6 +748,7 @@ $canvas->Tk::bind('<MouseWheel>' => [
     $mw->Tk::bind('<minus>' => sub { $self->mouse_wheel(-120); });
     $mw->Tk::bind('<Escape>' => sub {
         if    ($self->{avwap_picking}) { $self->avwap_cancel_pick(); }
+        elsif ($self->{avp_picking})   { $self->avp_cancel_pick(); }
         elsif ($self->{replay_picking}) { $self->replay_cancel_pick(); }
         elsif ($self->{replay_mode}) { $self->replay_exit(); }
         else                         { $mw->destroy; }
@@ -692,6 +763,7 @@ $canvas->Tk::bind('<MouseWheel>' => [
     # Escape funcione sin importar qué widget tenga el foco en ese momento.
     $canvas->Tk::bind('<Escape>' => sub {
         if    ($self->{avwap_picking}) { $self->avwap_cancel_pick(); }
+        elsif ($self->{avp_picking})   { $self->avp_cancel_pick(); }
         elsif ($self->{replay_picking}) { $self->replay_cancel_pick(); }
         elsif ($self->{replay_mode}) { $self->replay_exit(); }
         else                         { $mw->destroy; }
@@ -1077,6 +1149,9 @@ sub _replay_recalc_indicators {
     # AVWAP: acumulativo desde un anchor fijo — NO usa el WindowProxy deslizante
     # (perdería el anchor). Se recalcula con historia completa acotada al cursor.
     $self->_recalc_avwap();
+    # AVP (Perfil de Volumen Anclado): mismo criterio — anchor fijo, historia
+    # completa acotada al cursor (ReplayProxy), nunca WindowProxy.
+    $self->_recalc_avp();
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1188,26 +1263,27 @@ sub _event_anchor {
     return $best;
 }
 
-# POC (mínimo autónomo, placeholder hasta el Volume Profile real): sobre una
-# ventana de $lookback velas, agrupa volumen por precio (bucket de ~tick) y
-# ancla al candle más reciente del bin de mayor volumen acumulado.
+# POC del AVWAP: usa el POC REAL del Volume Profile. Sobre una ventana de
+# $lookback velas ≤ $limit calcula el perfil con el MISMO algoritmo fiel a TV
+# (compute_profile) y ancla al candle más reciente cuyo rango [low,high]
+# contiene el precio del POC.
 sub _poc_anchor {
     my ($self, $limit, $lookback) = @_;
     $lookback //= 500;
     return undef if $limit < 0;
     my $lo = $limit - $lookback; $lo = 0 if $lo < 0;
-    my $bucket = 5;   # tamaño de bin en puntos (NQ ~ tick grande)
-    my (%vol, %last);
-    for my $i ($lo .. $limit) {
+    my $window = $self->{market}->get_slice($lo, $limit);
+    return undef unless $window && @$window;
+    my $res = Market::Indicators::VolumeProfile::compute_profile(
+        $window, %{ Market::Indicators::VolumeProfile::default_config() });
+    return undef unless $res;
+    my $poc = $res->{poc_price};
+    # Candle más reciente ≤ $limit cuyo rango contiene el precio del POC.
+    for (my $i = $limit; $i >= $lo; $i--) {
         my $c = $self->{market}->get_candle($i) or next;
-        my $price = ($c->{high} + $c->{low} + $c->{close}) / 3;
-        my $bin = int($price / $bucket);
-        $vol{$bin}  += ($c->{volume} // 0);
-        $last{$bin}  = $i;
+        return $i if $c->{low} <= $poc && $poc <= $c->{high};
     }
-    return undef unless %vol;
-    my ($poc_bin) = sort { $vol{$b} <=> $vol{$a} } keys %vol;
-    return $last{$poc_bin};
+    return $limit;   # fallback
 }
 
 # Entra al modo de selección de anchor manual: el próximo clic AÑADE un AVWAP.
@@ -1261,6 +1337,106 @@ sub avwap_toggle_type {
     my ($self, $key, $on) = @_;
     $self->{avwap_types}{$key} = $on ? 1 : 0;
     $self->_recalc_avwap();
+    $self->draw();
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANCHORED VOLUME PROFILE (AVP) — selección de anchor por clic y recálculo
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Colores de los perfiles manuales (multipivot).
+my @AVP_COLORS = ('#5b9cff', '#f0b90b', '#ab47bc', '#26c6da', '#ff7043');
+
+# Recalcula el AVP respetando el modo Replay. Reconstruye la lista de perfiles
+# desde los anchors manuales y calcula cada uno (ReplayProxy en replay: historia
+# acotada al cursor, sin fuga de futuro; NO usa el WindowProxy deslizante).
+sub _recalc_avp {
+    my ($self) = @_;
+    my $vp = $self->{indicators}->get_indicator('VolumeProfile');
+    return unless defined $vp;
+    $self->_rebuild_avp_profiles($vp);
+    if ($self->{replay_mode}) {
+        $vp->calculate_all(Market::ReplayProxy->new($self->{market}, $self->{replay_cursor}));
+    } else {
+        $vp->calculate_all($self->{market});
+    }
+}
+
+# Construye la lista de perfiles del AVP: uno por cada anchor manual ≤ límite.
+sub _rebuild_avp_profiles {
+    my ($self, $vp) = @_;
+    my $limit = $self->_replay_limit();
+    my @specs;
+    my $i = 0;
+    for my $idx (@{ $self->{avp_manual} }) {
+        next if $idx > $limit;
+        push @specs, {
+            key          => "avp$i",
+            anchor_index => $idx,
+            label        => 'AVP',
+            color        => $AVP_COLORS[$i % @AVP_COLORS],
+        };
+        $i++;
+    }
+    $vp->set_profiles(\@specs);
+}
+
+# Entra al modo de selección de anchor: el próximo clic AÑADE un AVP.
+sub avp_enter_pick {
+    my ($self) = @_;
+    return if $self->{avp_picking};
+    $self->{avp_picking} = 1;
+    $self->{canvas}->configure(-cursor => 'sb_h_double_arrow') if $self->{canvas};
+    $self->{_avp_btn}->configure(-text => '[ Clic para anclar ]',
+        -foreground => '#f0b90b', -background => '#2a1a00') if $self->{_avp_btn};
+    $self->draw();
+}
+
+sub avp_cancel_pick {
+    my ($self) = @_;
+    return unless $self->{avp_picking};
+    $self->{avp_picking} = 0;
+    $self->{canvas}->configure(-cursor => 'crosshair') if $self->{canvas};
+    $self->_avp_reset_btn();
+    $self->draw();
+}
+
+sub _avp_reset_btn {
+    my ($self) = @_;
+    $self->{_avp_btn}->configure(-text => 'Perfil Volumen',
+        -foreground => '#b2b5be', -background => '#1e222d') if $self->{_avp_btn};
+}
+
+# Añade un anchor en el índice dado (multipivot), recalcula y redibuja.
+sub set_avp_anchor {
+    my ($self, $idx) = @_;
+    $self->{avp_picking} = 0;
+    $self->{canvas}->configure(-cursor => 'crosshair') if $self->{canvas};
+    $self->_avp_reset_btn();
+    push @{ $self->{avp_manual} }, $idx;
+    $self->_recalc_avp();
+    $self->draw();
+}
+
+# Borra todos los perfiles anclados.
+sub avp_clear {
+    my ($self) = @_;
+    $self->{avp_manual} = [];
+    $self->_recalc_avp();
+    $self->draw();
+}
+
+# Cambia el modo de volumen del overlay (updown|total|delta) — sólo display.
+sub avp_set_mode {
+    my ($self, $mode) = @_;
+    $self->{avp_overlay}->set_mode($mode);
+    $self->draw();
+}
+
+# Muestra/oculta POC/VAH/VAL — sólo display.
+sub avp_toggle_visible {
+    my ($self, $key, $on) = @_;
+    $self->{avp_overlay}->set_visible($key, $on);
     $self->draw();
 }
 
@@ -1374,6 +1550,12 @@ sub set_timeframe {
         my $ac = $self->{market}->get_candle($idx);
         push @old_anchor_epochs, ($ac ? $ac->{epoch} : undef);
     }
+    # AVP: mismo criterio — reproyectar los anchors manuales por epoch.
+    my @old_avp_epochs;
+    for my $idx (@{ $self->{avp_manual} }) {
+        my $ac = $self->{market}->get_candle($idx);
+        push @old_avp_epochs, ($ac ? $ac->{epoch} : undef);
+    }
 
     $self->{tf} = $tf;
     $self->{market}->set_timeframe($tf);
@@ -1408,6 +1590,15 @@ sub set_timeframe {
         }
         $self->{avwap_manual} = \@new;
     }
+    if (@old_avp_epochs) {
+        my @new;
+        for my $ep (@old_avp_epochs) {
+            next unless defined $ep;
+            my $ni = $self->{market}->index_at_epoch($ep);
+            push @new, ($ni >= 0 ? $ni : 0);
+        }
+        $self->{avp_manual} = \@new;
+    }
 
     if ($self->{replay_mode}) {
         # Reproyectar el cursor a la nueva TF por epoch.
@@ -1427,6 +1618,7 @@ sub set_timeframe {
         # Reconstruir las series del AVWAP para la nueva TF (anchors manuales
         # reproyectados + auto re-resueltos) y recalcular.
         $self->_recalc_avwap();
+        $self->_recalc_avp();
     }
 
     $self->{locked_index} = undef;
@@ -1597,6 +1789,9 @@ sub draw {
     my $vwap_ind = $self->{indicators}->get_indicator('VWAP');
     $self->{vwap_overlay}->draw($c, $vwap_ind, $x_of, \%state) if defined $vwap_ind;
 
+    my $vp_ind = $self->{indicators}->get_indicator('VolumeProfile');
+    $self->{avp_overlay}->draw($c, $vp_ind, $x_of, \%state) if defined $vp_ind;
+
     # Limpia el área del ATR para ocultar cualquier vela/volumen que se haya pasado.
     $c->createRectangle(
         $self->{left}, $atr_top,
@@ -1627,7 +1822,7 @@ $self->{atr_panel}->draw($c, $atr, $x_of, \%state);
     #    (representa las velas "futuras" que quedarán ocultas)
     # 2. Línea vertical amarilla punteada siguiendo al mouse
     # 3. Etiqueta con la fecha/hora de la vela bajo el cursor
-    if (($self->{replay_picking} || $self->{avwap_picking}) && defined $self->{replay_pick_index}) {
+    if (($self->{replay_picking} || $self->{avwap_picking} || $self->{avp_picking}) && defined $self->{replay_pick_index}) {
         my $pick = $self->{replay_pick_index};
         if ($pick >= $start && $pick <= $end) {
             my $local_i = $pick - $start;
@@ -2062,8 +2257,8 @@ sub mouse_move {
         return;
     }
 
-    # Preview del anchor del AVWAP: reutiliza la línea de corte del replay pick.
-    if ($self->{avwap_picking}) {
+    # Preview del anchor del AVWAP/AVP: reutiliza la línea de corte del replay pick.
+    if ($self->{avwap_picking} || $self->{avp_picking}) {
         $self->{replay_pick_index} = $idx;
         $self->draw();
         return;
@@ -2099,6 +2294,14 @@ sub mouse_down {
     if ($self->{avwap_picking}) {
         if ($x >= $self->{left} && $x < $right && $y < $h - $self->{bottom_h}) {
             $self->set_avwap_anchor($self->x_to_index($x));
+        }
+        return;   # consumir el evento
+    }
+
+    # ── Modo selección de anchor del AVP (clic sobre una vela) ───────────────
+    if ($self->{avp_picking}) {
+        if ($x >= $self->{left} && $x < $right && $y < $h - $self->{bottom_h}) {
+            $self->set_avp_anchor($self->x_to_index($x));
         }
         return;   # consumir el evento
     }
