@@ -58,6 +58,30 @@ if (@csv_files == 1) {
 $market->set_timeframe(1);
 $market->print_summary();
 
+# ─── Interfaz gráfica: crear la ventana YA, antes de calcular indicadores ────
+# FIX ("la app parece trabada/congelada al arrancar"): antes, update_last()
+# corría sobre las ~100k velas de 1m ANTES de crear el MainWindow. Con
+# SMC_Structures (~20s) y Liquidity (~11s) recalculando todo el histórico,
+# no aparecía NINGUNA ventana durante 40-70s — el proceso está vivo y
+# trabajando, pero como no hay nada en pantalla, parece colgado (confirmado
+# con /mnt/wslg/weston.log: la ventana real no se registra hasta ese punto).
+# Ahora se crea la ventana primero y se muestra un aviso de carga para que
+# el usuario vea la app responder de inmediato; el cálculo sigue tardando
+# lo mismo, pero ya no da la impresión de estar trabada.
+my $mw = MainWindow->new();
+$mw->title('Motor de Charting - TradingView simple');
+$mw->configure(-background => '#1e222d');
+$mw->geometry('640x140');
+my $loading = $mw->Label(
+    -text       => "Cargando indicadores (SMC Structures, Liquidity, ZigZag)...\n"
+                 . "Puede tardar cerca de un minuto con historiales grandes.",
+    -font       => ['Arial', 11],
+    -background => '#1e222d',
+    -foreground => '#b2b5be',
+    -justify    => 'center',
+)->pack(-expand => 1, -fill => 'both', -padx => 20, -pady => 20);
+$mw->update;   # forzar el pintado inmediato antes de bloquear en el cálculo
+
 # ─── Indicadores ─────────────────────────────────────────────────────────────
 
 my $indicators = Market::IndicatorManager->new();
@@ -70,9 +94,8 @@ $indicators->register('ZigZagMTF',    Market::Indicators::ZigZagMTF->new());
 $indicators->register('ZigZagVolume', Market::Indicators::ZigZagVolume->new());
 $indicators->update_last($market);
 
-# ─── Interfaz gráfica ────────────────────────────────────────────────────────
+$loading->destroy;
 
-my $mw    = MainWindow->new();
 my $chart = Market::ChartEngine->new(
     mw         => $mw,
     market     => $market,
