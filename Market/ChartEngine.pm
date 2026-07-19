@@ -1258,6 +1258,10 @@ sub draw {
         end_index   => $end,
         mouse_index => $self->{mouse_index},
         last_candle => $self->{market}->last_candle(),
+        # Slice de velas visibles (índice local i = global start+i). Lo usa el
+        # overlay de Liquidity para anclar EQH/EQL al extremo RENDERIZADO del
+        # píxel (grouping-aware) y que la recta no "flote" al alejar el zoom.
+        candles     => $data,
     );
 
     $self->draw_time_axis($start, $end, $x_of, $right, $h);

@@ -37,12 +37,16 @@ use Market::Panels::Scales;
 # Colores EXACTOS de la Tabla 2 del PDF
 my $COLOR_BSL   = '#f23645';   # Rojo
 my $COLOR_SSL   = '#089981';   # Verde
-my $COLOR_EQH   = '#9c8a5c';   # Configurable — tono neutro dorado por defecto
-my $COLOR_EQL   = '#9c8a5c';
+my $COLOR_EQH   = '#f23645';   # Rojo  (LuxAlgo swingBearishColor) — techos iguales
+my $COLOR_EQL   = '#089981';   # Verde (LuxAlgo swingBullishColor) — pisos iguales
 my $COLOR_SWEEP_UP   = '#f23645';   # Rojo (Tabla 2: Sweep Up)
 my $COLOR_SWEEP_DOWN = '#089981';   # Verde (Tabla 2: Sweep Down)
 my $COLOR_GRAB  = '#f59e0b';   # Naranja
 my $COLOR_RUN   = '#2962ff';   # Azul
+
+# Cantidad máxima de niveles VIVOS por tipo (BSL/SSL/EQH/EQL) que se dibujan,
+# de más reciente a más antiguo. Mantiene el gráfico limpio como LuxAlgo.
+our $LIQ_MAX_RECENT = 8;
 
 sub new {
     my ($class, %args) = @_;
@@ -95,24 +99,43 @@ sub draw {
     return unless defined $min && defined $max;
 
     my $levels = $liq->levels_in_range($start, $end);
+    my @drawn_labels;   # [ [x,y], ... ] etiquetas ya dibujadas (anti-solape)
 
+    # ── BSL/SSL: concepto propio (no LuxAlgo), muy ruidoso (~9000 de cada uno).
+    #    Se ocultan los BARRIDOS y se capan a los N más recientes VIVOS por tipo.
+    my %live;
     for my $lv (@$levels) {
-        if ($lv->{kind} eq 'BSL') {
-            $self->_draw_bsl_ssl($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, $right)
-                if $self->{visible}{bsl};
-        } elsif ($lv->{kind} eq 'SSL') {
-            $self->_draw_bsl_ssl($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, $right)
-                if $self->{visible}{ssl};
-        } elsif ($lv->{kind} eq 'EQH') {
-            $self->_draw_eq($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h)
-                if $self->{visible}{eqh};
-        } elsif ($lv->{kind} eq 'EQL') {
-            $self->_draw_eq($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h)
-                if $self->{visible}{eql};
-        }
+        my $k = $lv->{kind};
+        next unless $k eq 'BSL' || $k eq 'SSL';
+        next if defined $lv->{swept_at} && $lv->{swept_at} <= $end;   # consumido
+        push @{ $live{$k} }, $lv;
+    }
+    for my $k (qw(BSL SSL)) {
+        next unless $self->{visible}{ lc $k };
+        my @lst = sort { $b->{index} <=> $a->{index} } @{ $live{$k} // [] };
+        @lst = @lst[0 .. $LIQ_MAX_RECENT - 1] if @lst > $LIQ_MAX_RECENT;
+        $self->_draw_bsl_ssl($canvas, $_, $x_of, $start, $end, $min, $max, $top, $h, $right, \@drawn_labels)
+            for @lst;
+    }
 
-        # Marcadores de resolución (Sweep/Grab/Run) — independientes del
-        # kind del nivel, se dibujan sobre la vela donde se resolvió.
+    # ── EQH/EQL: como LuxAlgo — objetos PERSISTENTES. Se dibujan todos los que
+    #    intersectan el viewport por SEGMENTO (pair_index..index), sin filtro de
+    #    barrido y sin cap, de modo que se mantienen con cualquier zoom (el
+    #    filtro por 'index' de levels_in_range los hacía desaparecer al alejar
+    #    el 2º pivote de pantalla). El anti-solape evita amontonar etiquetas.
+    if ($self->{visible}{eqh} || $self->{visible}{eql}) {
+        for my $lv (@{ $liq->eq_levels() }) {
+            next unless ($lv->{kind} eq 'EQH' && $self->{visible}{eqh})
+                     || ($lv->{kind} eq 'EQL' && $self->{visible}{eql});
+            my $lo = defined $lv->{pair_index} ? $lv->{pair_index} : $lv->{index};
+            next unless $lo <= $end && $lv->{index} >= $start;   # segmento visible
+            $self->_draw_eq($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, \@drawn_labels, $state->{candles});
+        }
+    }
+
+    # Marcadores de resolución (Sweep/Grab/Run) — independientes del kind del
+    # nivel; ya son escasos (sólo niveles Resolved) así que se dibujan todos.
+    for my $lv (@$levels) {
         next unless $lv->{state} eq 'Resolved' && defined $lv->{classification};
 
         if ($lv->{classification} eq 'Sweep' && $self->{visible}{sweep}) {
@@ -125,6 +148,42 @@ sub draw {
     }
 }
 
+# Anti-solape: true (y registra la posición) si la etiqueta en ($x,$y) no está
+# demasiado cerca de otra ya dibujada. Evita el amontonamiento "EQHEQL/BSLBSL".
+sub _label_ok {
+    my ($drawn, $x, $y) = @_;
+    for my $p (@$drawn) {
+        return 0 if abs($p->[0] - $x) < 26 && abs($p->[1] - $y) < 9;
+    }
+    push @$drawn, [ $x, $y ];
+    return 1;
+}
+
+# Extremo RENDERIZADO del píxel que contiene al pivote global $gi: max high
+# (is_high) / min low, sobre las velas del slice que caen en el mismo bucket de
+# píxel que el pivote — igual criterio que PricePanel::_build_pixel_groups
+# (bucket = int(x+0.5)). Así EQH/EQL se anclan a la mecha que realmente se
+# dibuja a cualquier zoom. Devuelve undef si el pivote está fuera del slice.
+sub _rendered_extreme {
+    my ($candles, $cstart, $x_of, $gi, $is_high) = @_;
+    return undef unless $candles;
+    my $li = $gi - $cstart;
+    return undef if $li < 0 || $li > $#$candles;
+    my $bucket = int($x_of->($li) + 0.5);
+    my $ext = $is_high ? $candles->[$li]{high} : $candles->[$li]{low};
+    for my $dir (-1, 1) {
+        my $j = $li;
+        while (1) {
+            $j += $dir;
+            last if $j < 0 || $j > $#$candles;
+            last if int($x_of->($j) + 0.5) != $bucket;
+            my $v = $is_high ? $candles->[$j]{high} : $candles->[$j]{low};
+            $ext = $v if ($is_high ? $v > $ext : $v < $ext);
+        }
+    }
+    return $ext;
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _draw_bsl_ssl — línea horizontal discontinua/punteada (Tabla 2).
 # BSL en rojo, SSL en verde. Se extiende desde el índice de detección
@@ -132,7 +191,7 @@ sub draw {
 # visible si nunca se barrió).
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_bsl_ssl {
-    my ($self, $canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, $right) = @_;
+    my ($self, $canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, $right, $drawn) = @_;
 
     my $is_bsl = ($lv->{kind} eq 'BSL');
     my $color  = $is_bsl ? $COLOR_BSL : $COLOR_SSL;
@@ -157,13 +216,16 @@ sub _draw_bsl_ssl {
         -dash  => [4, 3],
         -tags  => 'liq_level',
     );
-    $canvas->createText($x2 + 4, $y,
-        -anchor => 'w',
-        -text   => $label,
-        -fill   => $color,
-        -font   => ['Arial', 7, 'bold'],
-        -tags   => 'liq_level',
-    );
+    # La etiqueta se omite si se solaparía con otra ya dibujada (la línea queda).
+    if (!$drawn || _label_ok($drawn, $x2 + 4, $y)) {
+        $canvas->createText($x2 + 4, $y,
+            -anchor => 'w',
+            -text   => $label,
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'liq_level',
+        );
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,32 +233,48 @@ sub _draw_bsl_ssl {
 # pair_index es el primer pivote del par; lv->{index} es el segundo.
 # ─────────────────────────────────────────────────────────────────────────────
 sub _draw_eq {
-    my ($self, $canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h) = @_;
+    my ($self, $canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, $drawn, $candles) = @_;
     return unless defined $lv->{pair_index};
-
-    my $pair_local = $lv->{pair_index} - $start;
-    my $cur_local  = $lv->{index} - $start;
     return if $lv->{pair_index} < $start && $lv->{index} < $start;   # ambos fuera
 
-    my $x1 = $x_of->($pair_local);
-    my $x2 = $x_of->($cur_local);
-    my $y  = $self->{scale}->price_to_y($lv->{price}, $min, $max, $top, $h);
-    return if $y < $top || $y > $top + $h;
+    # FIX (contraste con LuxAlgo): la línea conecta la PUNTA DE MECHA de cada
+    # pivote (pair_price -> price), NO una horizontal al precio del 2º pivote.
+    #
+    # FIX 2 (grouping-aware): al alejar el zoom, PricePanel agrupa varias velas
+    # por píxel y dibuja el EXTREMO del grupo. Si anclamos al high/low del
+    # pivote individual, la recta flota "a media vela" cuando en ese píxel cae
+    # una vela más extrema. Se ancla al mismo extremo RENDERIZADO del píxel
+    # (max high EQH / min low EQL de las velas del bucket) para que la recta
+    # toque siempre la mecha visible, a cualquier zoom. Sin agrupación el bucket
+    # sólo contiene el pivote -> devuelve su propio high/low (idéntico a antes).
+    my $is_high    = ($lv->{kind} eq 'EQH');
+    my $pair_price = $lv->{pair_price} // $lv->{price};
+    my $p1 = _rendered_extreme($candles, $start, $x_of, $lv->{pair_index}, $is_high) // $pair_price;
+    my $p2 = _rendered_extreme($candles, $start, $x_of, $lv->{index},      $is_high) // $lv->{price};
+
+    my $x1 = $x_of->($lv->{pair_index} - $start);
+    my $x2 = $x_of->($lv->{index}      - $start);
+    my $y1 = $self->{scale}->price_to_y($p1, $min, $max, $top, $h);
+    my $y2 = $self->{scale}->price_to_y($p2, $min, $max, $top, $h);
+    return if ($y1 < $top && $y2 < $top) || ($y1 > $top + $h && $y2 > $top + $h);
 
     my $color = ($lv->{kind} eq 'EQH') ? $COLOR_EQH : $COLOR_EQL;
 
-    $canvas->createLine($x1, $y, $x2, $y,
+    $canvas->createLine($x1, $y1, $x2, $y2,
         -fill  => $color,
         -width => 1,
+        -dash  => [2, 2],           # punteado, como LuxAlgo (line.style_dotted)
         -tags  => 'liq_eq',
     );
-    $canvas->createText($x2 + 4, $y,
-        -anchor => 'w',
-        -text   => $lv->{kind},
-        -fill   => $color,
-        -font   => ['Arial', 7, 'bold'],
-        -tags   => 'liq_eq',
-    );
+    if (!$drawn || _label_ok($drawn, $x2 + 4, $y2)) {
+        $canvas->createText($x2 + 4, $y2,
+            -anchor => 'w',
+            -text   => $lv->{kind},
+            -fill   => $color,
+            -font   => ['Arial', 7, 'bold'],
+            -tags   => 'liq_eq',
+        );
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

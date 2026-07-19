@@ -131,6 +131,15 @@ sub values {
     return $self->{levels};
 }
 
+# Sólo los niveles EQH/EQL. Los usa el overlay para recorrerlos por
+# intersección de SEGMENTO (pair_index..index) con el viewport, de forma que
+# se mantengan visibles con cualquier zoom (persistentes, como LuxAlgo) — sin
+# barajar los ~9000 BSL/SSL ni depender del filtro por index de levels_in_range.
+sub eq_levels {
+    my ($self) = @_;
+    return [ grep { $_->{kind} eq 'EQH' || $_->{kind} eq 'EQL' } @{ $self->{levels} } ];
+}
+
 # Acceso directo: nivel(es) detectados en una vela específica, o undef.
 sub levels_at {
     my ($self, $index) = @_;
@@ -415,37 +424,46 @@ sub _detect_levels {
     # OPTIMIZADO: cada high se empareja SOLO con el previo más cercano en
     # precio dentro de una ventana acotada de swings (LOOKBACK). Antes esto
     # era O(n^2) y generaba un nivel por CADA par -> explosión de niveles.
-    my $LOOKBACK = $self->{eq_lookback};
+    # FIX (contraste con LuxAlgo): emparejar SÓLO con el swing high
+    # inmediatamente anterior (no una ventana de lookback). Dos swing highs
+    # CONSECUTIVOS casi iguales no tienen ninguna vela más alta entre medias,
+    # así que la recta que los une nunca atraviesa otra vela — igual que TV.
+    # (Antes se comparaba contra los 'eq_lookback' anteriores, lo que permitía
+    #  unir pivotes con un high mayor en medio -> la recta cruzaba esa vela.)
     for (my $b = 1; $b <= $#highs; $b++) {
         my $tolerance = _tolerance_at($atr, $highs[$b]{index}, $factor);
         next if !defined $tolerance;
-        my $lo = $b - $LOOKBACK; $lo = 0 if $lo < 0;
-        my ($best_a, $best_diff);
-        for (my $a = $b - 1; $a >= $lo; $a--) {
-            my $diff = abs($highs[$a]{price} - $highs[$b]{price});
-            if ($diff <= $tolerance && (!defined $best_diff || $diff < $best_diff)) {
-                $best_diff = $diff; $best_a = $a;
-            }
+        my $a = $b - 1;
+        next if abs($highs[$a]{price} - $highs[$b]{price}) > $tolerance;
+        # Garantía "no cruza velas": descartar el par si alguna vela ENTRE los
+        # dos pivotes supera a ambos extremos (una vela no-swing puede exceder
+        # a dos swing highs consecutivos con depth pequeño). Sin esto la recta
+        # casi-horizontal pasaría por debajo de esa mecha.
+        my $lim = $highs[$a]{price} > $highs[$b]{price} ? $highs[$a]{price} : $highs[$b]{price};
+        my $clean = 1;
+        for my $j ($highs[$a]{index} + 1 .. $highs[$b]{index} - 1) {
+            if ($data->[$j]{high} > $lim) { $clean = 0; last; }
         }
-        $self->_push_level($highs[$b]{index}, $highs[$b]{price}, 'EQH', $highs[$best_a]{index})
-            if defined $best_a;
+        $self->_push_level($highs[$b]{index}, $highs[$b]{price}, 'EQH',
+                           $highs[$a]{index}, $highs[$a]{price}) if $clean;
     }
 
     # ── EQL: pares de Swing Lows dentro de tolerancia ATR*0.10 ─────────────
-    my $LOOKBACK_L = $self->{eq_lookback};
+    # EQL: mismo criterio consecutivo que EQH (sólo el swing low anterior).
     for (my $b = 1; $b <= $#lows; $b++) {
         my $tolerance = _tolerance_at($atr, $lows[$b]{index}, $factor);
         next if !defined $tolerance;
-        my $lo = $b - $LOOKBACK_L; $lo = 0 if $lo < 0;
-        my ($best_a, $best_diff);
-        for (my $a = $b - 1; $a >= $lo; $a--) {
-            my $diff = abs($lows[$a]{price} - $lows[$b]{price});
-            if ($diff <= $tolerance && (!defined $best_diff || $diff < $best_diff)) {
-                $best_diff = $diff; $best_a = $a;
-            }
+        my $a = $b - 1;
+        next if abs($lows[$a]{price} - $lows[$b]{price}) > $tolerance;
+        # Simétrico a EQH: descartar si una vela intermedia perfora por debajo
+        # de ambos mínimos (la recta cruzaría esa vela).
+        my $lim = $lows[$a]{price} < $lows[$b]{price} ? $lows[$a]{price} : $lows[$b]{price};
+        my $clean = 1;
+        for my $j ($lows[$a]{index} + 1 .. $lows[$b]{index} - 1) {
+            if ($data->[$j]{low} < $lim) { $clean = 0; last; }
         }
-        $self->_push_level($lows[$b]{index}, $lows[$b]{price}, 'EQL', $lows[$best_a]{index})
-            if defined $best_a;
+        $self->_push_level($lows[$b]{index}, $lows[$b]{price}, 'EQL',
+                           $lows[$a]{index}, $lows[$a]{price}) if $clean;
     }
 
     # Reordenar cronológicamente: los pasos anteriores insertan BSL/SSL
@@ -616,13 +634,14 @@ sub mark_external_levels {
 # Estado inicial siempre 'Detected' — la máquina de estados lo hace
 # evolucionar más adelante en _run_state_machine().
 sub _push_level {
-    my ($self, $index, $price, $kind, $pair_index) = @_;
+    my ($self, $index, $price, $kind, $pair_index, $pair_price) = @_;
 
     my $level = {
         index          => $index,
         price          => $price,
         kind           => $kind,
         pair_index     => $pair_index,
+        pair_price     => $pair_price,   # EQH/EQL: precio (punta de mecha) del 1er pivote
         state          => 'Detected',
         classification => undef,
         swept_at       => undef,
@@ -692,9 +711,25 @@ sub _run_state_machine {
         $level->{state}    = 'Swept';
         $level->{swept_at} = $swept_at;
 
-        # ── Evaluar qué pasa después del cruce ────────────────────────────
-        # Primero: ¿cuántas velas consecutivas, empezando en swept_at,
-        # cierran de forma ESTRICTA fuera del nivel? (para detectar Run)
+        # ── Sweep (Barrido Estándar, PDF 4.2) ─────────────────────────────
+        # La MISMA vela del cruce cierra de vuelta DENTRO del rango
+        # ("High > BSL seguido de un Close < BSL"): rechazo por mecha. Es el
+        # caso por defecto y el más común. Antes esto caía en Grab y la rama
+        # Sweep era inalcanzable (candles_to_reclaim nunca superaba grab_max),
+        # así que el toggle "Sweep" no dibujaba nada.
+        my $swept_close  = $data->[$swept_at]{close};
+        my $swept_inside = $is_ceiling ? ($swept_close < $price) : ($swept_close > $price);
+        if ($swept_inside) {
+            $level->{state}          = 'Reclaimed';
+            $level->{classification} = 'Sweep';
+            $level->{resolved_at}    = $swept_at;
+            $level->{state}          = 'Resolved';
+            next;
+        }
+
+        # ── La vela del cruce cerró FUERA: ¿Run (aceptación) o Grab? ──────
+        # ¿Cuántas velas consecutivas, empezando en swept_at, cierran de forma
+        # ESTRICTA fuera del nivel? (para detectar Run)
         my $consecutive_outside = 0;
         for (my $j = $swept_at; $j < $n; $j++) {
             my $close = $data->[$j]{close};
@@ -727,12 +762,15 @@ sub _run_state_machine {
         }
 
         if (defined $reclaim_at) {
-            my $candles_to_reclaim = $reclaim_at - $swept_at;
-            $level->{state} = 'Reclaimed';
-            $level->{classification} =
-                ($candles_to_reclaim <= $grab_max) ? 'Grab' : 'Sweep';
-            $level->{resolved_at} = $reclaim_at;
-            $level->{state} = 'Resolved';
+            # La vela del cruce cerró fuera pero el precio regresó dentro sin
+            # alcanzar las N consecutivas del Run: rechazo en pocas velas =
+            # Grab (el Sweep de misma-vela ya se resolvió arriba). El reclaim
+            # ocurre siempre dentro de run_n-1 velas, así que grab_max no puede
+            # ser superado — Grab es la única clasificación posible aquí.
+            $level->{state}          = 'Reclaimed';
+            $level->{classification} = 'Grab';
+            $level->{resolved_at}    = $reclaim_at;
+            $level->{state}          = 'Resolved';
         }
         # Si no hubo ni Run ni Reclaimed dentro de los datos disponibles,
         # el nivel queda en estado 'Swept' — su ciclo aún no concluyó
