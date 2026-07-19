@@ -40,8 +40,12 @@ sub new {
         liq_overlay => Market::Overlays::Liquidity->new(),
         zz_overlay  => Market::Overlays::ZigZag->new(),
         vwap_overlay => Market::Overlays::VWAP->new(),
-        # AVWAP: modo de selección de anchor por clic (como el replay pick).
-        avwap_picking => 0,
+        # AVWAP multipivot (PDF sección 8):
+        avwap_picking => 0,                 # modo "clic para anclar" (manual)
+        avwap_manual  => [],                # lista de índices globales anclados a mano
+        avwap_types   => {                  # anclajes automáticos activos
+            session => 0, open => 0, bos => 0, choch => 0, poc => 0,
+        },
 
         # ── Estado del sistema Replay (Fase 2) ───────────────────────────────
         # replay_mode   : 0 = normal, 1 = en modo replay activo
@@ -359,36 +363,59 @@ sub run {
         $_refresh_zz_res_btns->($k);
     }
 
-    # ── AVWAP (Anchored VWAP) ────────────────────────────────────────────────
-    my %vwap_var = (vwap => 1, band1 => 1, band2 => 1, band3 => 0);
-    my %vwap_label = (vwap => 'VWAP', band1 => 'Banda 1σ', band2 => 'Banda 2σ', band3 => 'Banda 3σ');
-    my @vwap_order = qw(vwap band1 band2 band3);
+    # ── AVWAP (Anchored VWAP multipivot) ─────────────────────────────────────
     my $vwap_box = $ov_win->Frame(-background => '#1e222d')
         ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
     $vwap_box->Label(-text => 'AVWAP', -background => '#1e222d',
         -foreground => '#5b9cff', -font => ['Arial', 9, 'bold'])
         ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
-    # Botón "Anclar" (entra al modo clic-para-anclar)
+    # Botón "Anclar" (clic para añadir un AVWAP manual) + "Limpiar".
     $vwap_box->Button(
         -text => 'Anclar (clic en vela)', -relief => 'flat', -borderwidth => 0,
         -padx => 8, -pady => 3, -font => ['Arial', 8, 'bold'],
         -foreground => '#ffffff', -background => '#2962ff',
         -activeforeground => '#ffffff', -activebackground => '#1a47cc', -cursor => 'hand2',
         -command => sub { $ov_win->withdraw(); $self->avwap_enter_pick(); },
-    )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 4]);
-    for my $key (@vwap_order) {
+    )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 2]);
+    $vwap_box->Button(
+        -text => 'Limpiar', -relief => 'flat', -borderwidth => 0,
+        -padx => 8, -pady => 2, -font => ['Arial', 8, 'bold'],
+        -foreground => '#b2b5be', -background => '#2a2e39',
+        -activeforeground => '#ffffff', -activebackground => '#3a3e49', -cursor => 'hand2',
+        -command => sub { $self->avwap_clear(); },
+    )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 6]);
+
+    # Anclajes automáticos (PDF sección 8) — la ocurrencia más reciente por tipo.
+    my %vwap_auto = (session => 0, open => 0, bos => 0, choch => 0, poc => 0);
+    my %vwap_auto_label = (
+        session => 'Sesión', open => 'Apertura', bos => 'BOS', choch => 'CHoCH', poc => 'POC',
+    );
+    for my $key (qw(session open bos choch poc)) {
         my $k = $key;
         $vwap_box->Checkbutton(
-            -text     => $vwap_label{$k},
-            -variable => \$vwap_var{$k},
+            -text     => $vwap_auto_label{$k},
+            -variable => \$vwap_auto{$k},
             -onvalue  => 1, -offvalue => 0,
-            -command  => sub {
-                $self->{vwap_overlay}->set_visible($k, $vwap_var{$k});
-                $self->draw();
-            },
+            -command  => sub { $self->avwap_toggle_type($k, $vwap_auto{$k}); },
             -background => '#1e222d', -foreground => '#b2b5be',
             -activebackground => '#1e222d', -activeforeground => '#ffffff',
             -selectcolor => '#2962ff', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
+    # Visibilidad de bandas (aplica a las series que las traen — el manual).
+    my %vwap_band = (band1 => 1, band2 => 1, band3 => 0);
+    for my $key (qw(band1 band2 band3)) {
+        my $k = $key;
+        my %lbl = (band1 => 'Banda 1σ', band2 => 'Banda 2σ', band3 => 'Banda 3σ');
+        $vwap_box->Checkbutton(
+            -text     => $lbl{$k},
+            -variable => \$vwap_band{$k},
+            -onvalue  => 1, -offvalue => 0,
+            -command  => sub { $self->{vwap_overlay}->set_visible($k, $vwap_band{$k}); $self->draw(); },
+            -background => '#1e222d', -foreground => '#787b86',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#26a69a', -font => ['Arial', 8], -anchor => 'w',
         )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
     }
 
@@ -1056,13 +1083,25 @@ sub _replay_recalc_indicators {
 # ANCHORED VWAP — selección de anchor por clic y recálculo
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Recalcula el AVWAP respetando el modo Replay. Como es acumulativo desde un
-# anchor FIJO, no puede usar el WindowProxy deslizante (perdería el anchor):
-# en Replay usa un ReplayProxy (historia completa acotada al cursor).
+# Colores por tipo de anclaje (multipivot).
+my %AVWAP_COLOR = (
+    manual  => '#2962ff',   # azul
+    session => '#26a69a',   # teal
+    open    => '#f59e0b',   # naranja
+    bos     => '#089981',   # verde
+    choch   => '#f23645',   # rojo
+    poc     => '#9c27b0',   # púrpura
+);
+
+# Recalcula el AVWAP respetando el modo Replay. Reconstruye la lista de series
+# (resolviendo los anchors de cada tipo activo hasta el límite actual) y luego
+# calcula el VWAP de cada una. Acumulativo desde anchors FIJOS -> NO usa el
+# WindowProxy deslizante; en Replay usa un ReplayProxy (historia hasta cursor).
 sub _recalc_avwap {
     my ($self) = @_;
     my $v = $self->{indicators}->get_indicator('VWAP');
     return unless defined $v;
+    $self->_rebuild_avwap_series($v);
     if ($self->{replay_mode}) {
         $v->calculate_all(Market::ReplayProxy->new($self->{market}, $self->{replay_cursor}));
     } else {
@@ -1070,8 +1109,108 @@ sub _recalc_avwap {
     }
 }
 
-# Entra al modo de selección de anchor: el próximo clic en una vela fija el
-# punto de anclaje del AVWAP (igual patrón que el replay pick).
+# Construye la lista de series del AVWAP: manuales + la ocurrencia MÁS RECIENTE
+# de cada anclaje automático activo, todas ≤ límite (cursor en Replay).
+sub _rebuild_avwap_series {
+    my ($self, $v) = @_;
+    my $limit = $self->_replay_limit();   # último índice visible (cursor en replay)
+    my @specs;
+
+    # Manuales (multipivot): una serie por cada anchor por clic.
+    my $mi = 0;
+    for my $idx (@{ $self->{avwap_manual} }) {
+        next if $idx > $limit;
+        push @specs, { key => "m$mi", anchor_index => $idx, label => 'VWAP',
+            color => $AVWAP_COLOR{manual}, bands_on => [1, 1, 0] };
+        $mi++;
+    }
+
+    my $t = $self->{avwap_types};
+    my @auto = (
+        [ 'session', 'Sesión',   sub { $self->_session_anchor($limit) } ],
+        [ 'open',    'Apertura', sub { $self->_open_anchor($limit) } ],
+        [ 'bos',     'BOS',      sub { $self->_event_anchor($limit, 'BOS') } ],
+        [ 'choch',   'CHoCH',    sub { $self->_event_anchor($limit, 'CHoCH') } ],
+        [ 'poc',     'POC',      sub { $self->_poc_anchor($limit) } ],
+    );
+    for my $a (@auto) {
+        my ($key, $label, $resolver) = @$a;
+        next unless $t->{$key};
+        my $idx = $resolver->();
+        next unless defined $idx && $idx >= 0 && $idx <= $limit;
+        push @specs, { key => $key, anchor_index => $idx, label => $label,
+            color => $AVWAP_COLOR{$key}, bands_on => [0, 0, 0] };
+    }
+    $v->set_series(\@specs);
+}
+
+# Índice del primer candle del día que contiene a $limit (inicio de sesión).
+sub _session_anchor {
+    my ($self, $limit) = @_;
+    return undef if $limit < 0;
+    my $day = sub { my $c = $self->{market}->get_candle($_[0]); $c ? ($c->{time} =~ /^(\d{4}-\d\d-\d\d)/ ? $1 : '') : '' };
+    my $d = $day->($limit);
+    my $i = $limit;
+    $i-- while $i > 0 && $day->($i - 1) eq $d;
+    return $i;
+}
+
+# Índice del candle de apertura (cruce de las 09:30 = min-del-día ≥ 570) más
+# reciente ≤ $limit. Si el día de $limit aún no llegó a 09:30, usa el día previo.
+sub _open_anchor {
+    my ($self, $limit) = @_;
+    return undef if $limit < 0;
+    my $mod = sub {   # minutos del día del candle $i (o undef)
+        my $c = $self->{market}->get_candle($_[0]);
+        return undef unless $c && $c->{time} =~ /T(\d\d):(\d\d)/;
+        return $1 * 60 + $2;
+    };
+    for (my $i = $limit; $i > 0; $i--) {
+        my $m  = $mod->($i);
+        my $pm = $mod->($i - 1);
+        next unless defined $m && defined $pm;
+        return $i if $m >= 570 && $pm < 570;   # cruce de las 09:30
+    }
+    return undef;
+}
+
+# Índice del evento SMC ($type = 'BOS'|'CHoCH') más reciente ≤ $limit.
+sub _event_anchor {
+    my ($self, $limit, $type) = @_;
+    my $smc = $self->{indicators}->get_indicator('SMC_Structures');
+    return undef unless defined $smc && $smc->can('values_events');
+    my $best;
+    for my $ev (@{ $smc->values_events() }) {
+        next unless $ev->{type} eq $type;
+        next if $ev->{index} > $limit;
+        $best = $ev->{index} if !defined $best || $ev->{index} > $best;
+    }
+    return $best;
+}
+
+# POC (mínimo autónomo, placeholder hasta el Volume Profile real): sobre una
+# ventana de $lookback velas, agrupa volumen por precio (bucket de ~tick) y
+# ancla al candle más reciente del bin de mayor volumen acumulado.
+sub _poc_anchor {
+    my ($self, $limit, $lookback) = @_;
+    $lookback //= 500;
+    return undef if $limit < 0;
+    my $lo = $limit - $lookback; $lo = 0 if $lo < 0;
+    my $bucket = 5;   # tamaño de bin en puntos (NQ ~ tick grande)
+    my (%vol, %last);
+    for my $i ($lo .. $limit) {
+        my $c = $self->{market}->get_candle($i) or next;
+        my $price = ($c->{high} + $c->{low} + $c->{close}) / 3;
+        my $bin = int($price / $bucket);
+        $vol{$bin}  += ($c->{volume} // 0);
+        $last{$bin}  = $i;
+    }
+    return undef unless %vol;
+    my ($poc_bin) = sort { $vol{$b} <=> $vol{$a} } keys %vol;
+    return $last{$poc_bin};
+}
+
+# Entra al modo de selección de anchor manual: el próximo clic AÑADE un AVWAP.
 sub avwap_enter_pick {
     my ($self) = @_;
     return if $self->{avwap_picking};
@@ -1097,18 +1236,37 @@ sub _avwap_reset_btn {
         -foreground => '#b2b5be', -background => '#1e222d') if $self->{_avwap_btn};
 }
 
-# Fija el anchor en el índice dado, recalcula y redibuja.
+# Añade un anchor manual en el índice dado (multipivot), recalcula y redibuja.
 sub set_avwap_anchor {
     my ($self, $idx) = @_;
     $self->{avwap_picking} = 0;
     $self->{canvas}->configure(-cursor => 'crosshair') if $self->{canvas};
     $self->_avwap_reset_btn();
-    my $v = $self->{indicators}->get_indicator('VWAP');
-    return unless defined $v;
-    $v->set_anchor($idx);
+    push @{ $self->{avwap_manual} }, $idx;
     $self->_recalc_avwap();
     $self->draw();
 }
+
+# Borra todos los anchors (manuales y desactiva los automáticos).
+sub avwap_clear {
+    my ($self) = @_;
+    $self->{avwap_manual} = [];
+    $self->{avwap_types}{$_} = 0 for keys %{ $self->{avwap_types} };
+    $self->_recalc_avwap();
+    $self->draw();
+}
+
+# Activa/desactiva un tipo de anclaje automático y recalcula.
+sub avwap_toggle_type {
+    my ($self, $key, $on) = @_;
+    $self->{avwap_types}{$key} = $on ? 1 : 0;
+    $self->_recalc_avwap();
+    $self->draw();
+}
+
+# 1.2: cambia en caliente la temporalidad de referencia de ZigZagMTF/ZigZagVolume
+# y fuerza un recálculo COMPLETO (no incremental) respetando el modo Replay —
+# mismo criterio de "no fuga de velas futuras" que el resto de recálculos.
 
 # 1.2: cambia en caliente la temporalidad de referencia de ZigZagMTF/ZigZagVolume
 # y fuerza un recálculo COMPLETO (no incremental) respetando el modo Replay —
@@ -1208,13 +1366,13 @@ sub set_timeframe {
         $old_cursor_epoch = $c->{epoch} if defined $c;
     }
 
-    # AVWAP: el anchor es un índice de la TF ANTERIOR. Guardar su epoch para
-    # reproyectarlo a la TF nueva (que se mantenga en la MISMA vela real).
-    my $old_anchor_epoch;
-    my $vwap_ind = $self->{indicators}->get_indicator('VWAP');
-    if (defined $vwap_ind && $vwap_ind->has_anchor) {
-        my $ac = $self->{market}->get_candle($vwap_ind->anchor_index);
-        $old_anchor_epoch = $ac->{epoch} if defined $ac;
+    # AVWAP: los anchors MANUALES son índices de la TF ANTERIOR. Guardar sus
+    # epochs para reproyectarlos a la TF nueva (misma vela real). Los anclajes
+    # automáticos se re-resuelven solos en _rebuild_avwap_series.
+    my @old_anchor_epochs;
+    for my $idx (@{ $self->{avwap_manual} }) {
+        my $ac = $self->{market}->get_candle($idx);
+        push @old_anchor_epochs, ($ac ? $ac->{epoch} : undef);
     }
 
     $self->{tf} = $tf;
@@ -1238,11 +1396,17 @@ sub set_timeframe {
     my $atr = $self->{indicators}->get_indicator('ATR');
     $atr->calculate_all($self->{market}) if defined $atr;
 
-    # AVWAP: reproyectar el anchor a la nueva TF por epoch (reset_all() ya
-    # limpió sus points pero conservó anchor_index).
-    if (defined $vwap_ind && defined $old_anchor_epoch) {
-        my $new_a = $self->{market}->index_at_epoch($old_anchor_epoch);
-        $vwap_ind->set_anchor($new_a >= 0 ? $new_a : 0);
+    # AVWAP: reproyectar los anchors manuales a la nueva TF por epoch. El
+    # recálculo real (con la lista reconstruida) ocurre en _replay_recalc_
+    # indicators (replay) o update_last->..._recalc_avwap más abajo.
+    if (@old_anchor_epochs) {
+        my @new;
+        for my $ep (@old_anchor_epochs) {
+            next unless defined $ep;
+            my $ni = $self->{market}->index_at_epoch($ep);
+            push @new, ($ni >= 0 ? $ni : 0);
+        }
+        $self->{avwap_manual} = \@new;
     }
 
     if ($self->{replay_mode}) {
@@ -1260,6 +1424,9 @@ sub set_timeframe {
         $self->_replay_recalc_indicators();
     } else {
         $self->{indicators}->update_last($self->{market});
+        # Reconstruir las series del AVWAP para la nueva TF (anchors manuales
+        # reproyectados + auto re-resueltos) y recalcular.
+        $self->_recalc_avwap();
     }
 
     $self->{locked_index} = undef;
