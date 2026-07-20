@@ -17,6 +17,7 @@ use Market::Overlays::ZigZag;
 use Market::Overlays::VWAP;
 use Market::Overlays::VolumeProfile;
 use Market::Overlays::SupplyDemand;
+use Market::Overlays::StrategyBuilder;
 
 sub new {
     my ($class, %args) = @_;
@@ -46,10 +47,12 @@ sub new {
         avwap_picking => 0,                 # modo "clic para anclar" (manual)
         avwap_manual  => [],                # lista de índices globales anclados a mano
         avwap_types   => {                  # anclajes automáticos activos
-            session => 0, open => 0, bos => 0, choch => 0, poc => 0,
+            session => 0, open => 0, bos => 0, choch => 0, poc => 0, swing => 0,
         },
         # Supply/Demand Zones (DIY Custom Strategy Builder [ZP]):
         sd_overlay => Market::Overlays::SupplyDemand->new(),
+        # Strategy Builder: SuperTrend / HalfTrend / Range Filter (DIY [ZP]):
+        sb_overlay => Market::Overlays::StrategyBuilder->new(),
         # AVP — Perfil de Volumen Anclado multipivot (fiel a TradingView):
         avp_overlay => Market::Overlays::VolumeProfile->new(),
         avp_picking => 0,                   # modo "clic para anclar" (manual)
@@ -323,6 +326,32 @@ sub run {
         )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
     }
 
+    # ── Strategy Builder: SuperTrend / HalfTrend / Range Filter (DIY [ZP]) ──
+    my %sb_var = (supertrend => 0, halftrend => 0, rangefilter => 0);
+    my %sb_menu_label = (
+        supertrend  => 'SuperTrend',
+        halftrend   => 'HalfTrend',
+        rangefilter => 'Range Filter',
+    );
+    $sd_box->Label(-text => 'Strategy Builder', -background => '#1e222d',
+        -foreground => '#f0b90b', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [8, 4]);
+    for my $key (qw(supertrend halftrend rangefilter)) {
+        my $k = $key;
+        $sd_box->Checkbutton(
+            -text     => $sb_menu_label{$k},
+            -variable => \$sb_var{$k},
+            -onvalue  => 1, -offvalue => 0,
+            -command  => sub {
+                $self->{sb_overlay}->set_visible($k, $sb_var{$k});
+                $self->draw();
+            },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#f0b90b', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
     # ── ZigZag (dirección interna + externa) ─────────────────────────────
     my %zz_var = (zzmtf => 0, zzvolume => 0);
     my %zz_menu_label = (
@@ -422,11 +451,12 @@ sub run {
     )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 6]);
 
     # Anclajes automáticos (PDF sección 8) — la ocurrencia más reciente por tipo.
-    my %vwap_auto = (session => 0, open => 0, bos => 0, choch => 0, poc => 0);
+    my %vwap_auto = (session => 0, open => 0, bos => 0, choch => 0, poc => 0, swing => 0);
     my %vwap_auto_label = (
         session => 'Sesión', open => 'Apertura', bos => 'BOS', choch => 'CHoCH', poc => 'POC',
+        swing => 'Swing',
     );
-    for my $key (qw(session open bos choch poc)) {
+    for my $key (qw(session open bos choch poc swing)) {
         my $k = $key;
         $vwap_box->Checkbutton(
             -text     => $vwap_auto_label{$k},
@@ -1197,6 +1227,7 @@ my %AVWAP_COLOR = (
     bos     => '#089981',   # verde
     choch   => '#f23645',   # rojo
     poc     => '#9c27b0',   # púrpura
+    swing   => '#00b0ff',   # celeste (Dynamic Swing Anchored VWAP)
 );
 
 # Recalcula el AVWAP respetando el modo Replay. Reconstruye la lista de series
@@ -1238,6 +1269,7 @@ sub _rebuild_avwap_series {
         [ 'bos',     'BOS',      sub { $self->_event_anchor($limit, 'BOS') } ],
         [ 'choch',   'CHoCH',    sub { $self->_event_anchor($limit, 'CHoCH') } ],
         [ 'poc',     'POC',      sub { $self->_poc_anchor($limit) } ],
+        [ 'swing',   'Swing',    sub { $self->_swing_anchor($limit) } ],
     );
     for my $a (@auto) {
         my ($key, $label, $resolver) = @$a;
@@ -1290,6 +1322,20 @@ sub _event_anchor {
         next unless $ev->{type} eq $type;
         next if $ev->{index} > $limit;
         $best = $ev->{index} if !defined $best || $ev->{index} > $best;
+    }
+    return $best;
+}
+
+# Índice del swing pivot (major) más reciente ≤ $limit — anclaje "Dynamic Swing"
+# (de GHOST_IN_SWINGS). Reusa los swings ya detectados por SMC_Structures.
+sub _swing_anchor {
+    my ($self, $limit) = @_;
+    my $smc = $self->{indicators}->get_indicator('SMC_Structures');
+    return undef unless defined $smc && $smc->can('values_major_swings');
+    my $best;
+    for my $s (@{ $smc->values_major_swings() }) {
+        next if $s->{index} > $limit;
+        $best = $s->{index} if !defined $best || $s->{index} > $best;
     }
     return $best;
 }
@@ -1615,6 +1661,11 @@ sub set_timeframe {
     my $sd = $self->{indicators}->get_indicator('SupplyDemand');
     $sd->calculate_all($self->{market}) if defined $sd;
 
+    # Strategy Builder (SuperTrend/HalfTrend/Range Filter): también causal —
+    # mismo criterio que ATR/SupplyDemand, recalcular sobre el market completo.
+    my $sb = $self->{indicators}->get_indicator('StrategyBuilder');
+    $sb->calculate_all($self->{market}) if defined $sb;
+
     # AVWAP: reproyectar los anchors manuales a la nueva TF por epoch. El
     # recálculo real (con la lista reconstruida) ocurre en _replay_recalc_
     # indicators (replay) o update_last->..._recalc_avwap más abajo.
@@ -1831,6 +1882,9 @@ sub draw {
 
     my $sd_ind = $self->{indicators}->get_indicator('SupplyDemand');
     $self->{sd_overlay}->draw($c, $sd_ind, $x_of, \%state) if defined $sd_ind;
+
+    my $sb_ind = $self->{indicators}->get_indicator('StrategyBuilder');
+    $self->{sb_overlay}->draw($c, $sb_ind, $x_of, \%state) if defined $sb_ind;
 
     # Limpia el área del ATR para ocultar cualquier vela/volumen que se haya pasado.
     $c->createRectangle(

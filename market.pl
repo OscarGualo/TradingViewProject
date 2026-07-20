@@ -15,6 +15,7 @@ use Market::Indicators::ZigZagVolume;
 use Market::Indicators::VWAP;
 use Market::Indicators::VolumeProfile;
 use Market::Indicators::SupplyDemand;
+use Market::Indicators::StrategyBuilder;
 use Market::ChartEngine;
 
 # ─── Resolución de archivos CSV ──────────────────────────────────────────────
@@ -104,6 +105,8 @@ $indicators->register('VolumeProfile', Market::Indicators::VolumeProfile->new())
 # Supply/Demand Zones (DIY Custom Strategy Builder [ZP]) — defaults del script:
 # Swing Length=10, History=20, Box Width=2.5, ATR(50).
 $indicators->register('SupplyDemand', Market::Indicators::SupplyDemand->new());
+# Strategy Builder (DIY [ZP]) — SuperTrend(10,3), HalfTrend(2,2), Range Filter(100,3).
+$indicators->register('StrategyBuilder', Market::Indicators::StrategyBuilder->new());
 $indicators->update_last($market);
 
 $loading->destroy;
