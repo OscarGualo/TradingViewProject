@@ -18,6 +18,7 @@ use Market::Overlays::VWAP;
 use Market::Overlays::VolumeProfile;
 use Market::Overlays::SupplyDemand;
 use Market::Overlays::StrategyBuilder;
+use Market::Overlays::SessionVolumeProfile;
 
 sub new {
     my ($class, %args) = @_;
@@ -55,6 +56,8 @@ sub new {
         sb_overlay => Market::Overlays::StrategyBuilder->new(),
         # AVP — Perfil de Volumen Anclado multipivot (fiel a TradingView):
         avp_overlay => Market::Overlays::VolumeProfile->new(),
+        # SVP — Perfil de Volumen de Sesión (un histograma por día):
+        svp_overlay => Market::Overlays::SessionVolumeProfile->new(),
         avp_picking => 0,                   # modo "clic para anclar" (manual)
         avp_manual  => [],                  # lista de índices globales anclados a mano
 
@@ -535,6 +538,36 @@ sub run {
             -background => '#1e222d', -foreground => '#b2b5be',
             -activebackground => '#1e222d', -activeforeground => '#ffffff',
             -selectcolor => '#e53935', -font => ['Arial', 8], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+
+    # ── Session Volume Profile (un histograma por día) ───────────────────────
+    $avp_box->Label(-text => 'Session Volume', -background => '#1e222d',
+        -foreground => '#22d3ee', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [8, 4]);
+    my %svp_vis = (profiles => 0, poc => 0, va => 0);
+    my %svp_vis_lbl = (profiles => 'Perfiles', poc => 'POC', va => 'Área de Valor');
+    for my $key (qw(profiles poc va)) {
+        my $k = $key;
+        $avp_box->Checkbutton(
+            -text => $svp_vis_lbl{$k}, -variable => \$svp_vis{$k},
+            -onvalue => 1, -offvalue => 0,
+            -command => sub { $self->{svp_overlay}->set_visible($k, $svp_vis{$k}); $self->draw(); },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#22d3ee', -font => ['Arial', 8], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
+    my $svp_mode = 'updown';
+    my %svp_mode_lbl = (updown => 'Máx/Mín', total => 'Total', delta => 'Delta');
+    for my $m (qw(updown total delta)) {
+        my $mm = $m;
+        $avp_box->Radiobutton(
+            -text => $svp_mode_lbl{$m}, -value => $m, -variable => \$svp_mode,
+            -command => sub { $self->{svp_overlay}->set_mode($mm); $self->draw(); },
+            -background => '#1e222d', -foreground => '#787b86',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#22d3ee', -font => ['Arial', 8], -anchor => 'w',
         )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
     }
 
@@ -1213,6 +1246,13 @@ sub _replay_recalc_indicators {
     # AVP (Perfil de Volumen Anclado): mismo criterio — anchor fijo, historia
     # completa acotada al cursor (ReplayProxy), nunca WindowProxy.
     $self->_recalc_avp();
+
+    # SVP (Perfil de Volumen de Sesión): ReplayProxy de historia completa (NO
+    # WindowProxy, para no perder días pasados). La caché por día hace que sólo
+    # la sesión EN DESARROLLO (la del cursor) se recalcule → barato por paso.
+    my $svp = $ind->get_indicator('SessionVolumeProfile');
+    $svp->calculate_all(Market::ReplayProxy->new($self->{market}, $self->{replay_cursor}))
+        if defined $svp;
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1666,6 +1706,16 @@ sub set_timeframe {
     my $sb = $self->{indicators}->get_indicator('StrategyBuilder');
     $sb->calculate_all($self->{market}) if defined $sb;
 
+    # SVP (Perfil de Volumen de Sesión): re-agrupa por día en la nueva TF. Se
+    # invalida su caché (los índices de dibujo cambian de TF) y se recalcula
+    # sobre el market completo (los perfiles se construyen desde 1m; el overlay
+    # recorta por end_index, válido también en Replay).
+    my $svp = $self->{indicators}->get_indicator('SessionVolumeProfile');
+    if (defined $svp) {
+        $svp->invalidate_cache();
+        $svp->calculate_all($self->{market});
+    }
+
     # AVWAP: reproyectar los anchors manuales a la nueva TF por epoch. El
     # recálculo real (con la lista reconstruida) ocurre en _replay_recalc_
     # indicators (replay) o update_last->..._recalc_avwap más abajo.
@@ -1879,6 +1929,9 @@ sub draw {
 
     my $vp_ind = $self->{indicators}->get_indicator('VolumeProfile');
     $self->{avp_overlay}->draw($c, $vp_ind, $x_of, \%state) if defined $vp_ind;
+
+    my $svp_ind = $self->{indicators}->get_indicator('SessionVolumeProfile');
+    $self->{svp_overlay}->draw($c, $svp_ind, $x_of, \%state) if defined $svp_ind;
 
     my $sd_ind = $self->{indicators}->get_indicator('SupplyDemand');
     $self->{sd_overlay}->draw($c, $sd_ind, $x_of, \%state) if defined $sd_ind;

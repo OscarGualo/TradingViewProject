@@ -16,6 +16,7 @@ use Market::Indicators::VWAP;
 use Market::Indicators::VolumeProfile;
 use Market::Indicators::SupplyDemand;
 use Market::Indicators::StrategyBuilder;
+use Market::Indicators::SessionVolumeProfile;
 use Market::ChartEngine;
 
 # ─── Resolución de archivos CSV ──────────────────────────────────────────────
@@ -107,6 +108,8 @@ $indicators->register('VolumeProfile', Market::Indicators::VolumeProfile->new())
 $indicators->register('SupplyDemand', Market::Indicators::SupplyDemand->new());
 # Strategy Builder (DIY [ZP]) — SuperTrend(10,3), HalfTrend(2,2), Range Filter(100,3).
 $indicators->register('StrategyBuilder', Market::Indicators::StrategyBuilder->new());
+# Session Volume Profile — un perfil de volumen por día (sesión "Todas"), 24 filas.
+$indicators->register('SessionVolumeProfile', Market::Indicators::SessionVolumeProfile->new());
 $indicators->update_last($market);
 
 $loading->destroy;
