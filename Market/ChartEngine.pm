@@ -238,6 +238,7 @@ sub run {
 
     my %liq_var = (
         bsl => 0, ssl => 0, eqh => 0, eql => 0, sweep => 0, grab => 0, run => 0,
+        institutional_only => 0,
     );
     my %liq_menu_label = (
         bsl   => 'BSL',
@@ -247,8 +248,9 @@ sub run {
         sweep => 'Sweep',
         grab  => 'Liquidity Grab',
         run   => 'Liquidity Run',
+        institutional_only => 'Solo institucional (vol)',
     );
-    my @liq_order = qw(bsl ssl eqh eql sweep grab run);
+    my @liq_order = qw(bsl ssl eqh eql sweep grab run institutional_only);
 
     # Ventana del panel de overlays (creada oculta)
     my $ov_win = $mw->Toplevel();

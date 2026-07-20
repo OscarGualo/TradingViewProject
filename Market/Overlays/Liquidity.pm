@@ -61,6 +61,9 @@ sub new {
             sweep => 0,
             grab  => 0,
             run   => 0,
+            # PDF 4.4: cuando está ON, oculta los niveles NO institucionales
+            # (bajo volumen = ruido). El peso visual (grosor) se aplica siempre.
+            institutional_only => 0,
         },
     };
     bless $self, $class;
@@ -113,6 +116,8 @@ sub draw {
     for my $k (qw(BSL SSL)) {
         next unless $self->{visible}{ lc $k };
         my @lst = sort { $b->{index} <=> $a->{index} } @{ $live{$k} // [] };
+        # PDF 4.4: filtro institucional (oculta niveles de bajo volumen = ruido).
+        @lst = grep { $_->{institutional} } @lst if $self->{visible}{institutional_only};
         @lst = @lst[0 .. $LIQ_MAX_RECENT - 1] if @lst > $LIQ_MAX_RECENT;
         $self->_draw_bsl_ssl($canvas, $_, $x_of, $start, $end, $min, $max, $top, $h, $right, \@drawn_labels)
             for @lst;
@@ -127,6 +132,7 @@ sub draw {
         for my $lv (@{ $liq->eq_levels() }) {
             next unless ($lv->{kind} eq 'EQH' && $self->{visible}{eqh})
                      || ($lv->{kind} eq 'EQL' && $self->{visible}{eql});
+            next if $self->{visible}{institutional_only} && !$lv->{institutional};   # PDF 4.4
             my $lo = defined $lv->{pair_index} ? $lv->{pair_index} : $lv->{index};
             next unless $lo <= $end && $lv->{index} >= $start;   # segmento visible
             $self->_draw_eq($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h, \@drawn_labels, $state->{candles});
@@ -137,6 +143,7 @@ sub draw {
     # nivel; ya son escasos (sólo niveles Resolved) así que se dibujan todos.
     for my $lv (@$levels) {
         next unless $lv->{state} eq 'Resolved' && defined $lv->{classification};
+        next if $self->{visible}{institutional_only} && !$lv->{institutional};   # PDF 4.4
 
         if ($lv->{classification} eq 'Sweep' && $self->{visible}{sweep}) {
             $self->_draw_sweep_marker($canvas, $lv, $x_of, $start, $end, $min, $max, $top, $h);
@@ -210,9 +217,11 @@ sub _draw_bsl_ssl {
     my $y = $self->{scale}->price_to_y($lv->{price}, $min, $max, $top, $h);
     return if $y < $top || $y > $top + $h;
 
+    # PDF 4.4: peso visual — nivel institucional (alto volumen) más grueso.
+    my $lw = (defined $lv->{institutional} && !$lv->{institutional}) ? 1 : 2;
     $canvas->createLine($x1, $y, $x2, $y,
         -fill  => $color,
-        -width => 1,
+        -width => $lw,
         -dash  => [4, 3],
         -tags  => 'liq_level',
     );
@@ -260,9 +269,10 @@ sub _draw_eq {
 
     my $color = ($lv->{kind} eq 'EQH') ? $COLOR_EQH : $COLOR_EQL;
 
+    my $lw = (defined $lv->{institutional} && !$lv->{institutional}) ? 1 : 2;   # PDF 4.4
     $canvas->createLine($x1, $y1, $x2, $y2,
         -fill  => $color,
-        -width => 1,
+        -width => $lw,
         -dash  => [2, 2],           # punteado, como LuxAlgo (line.style_dotted)
         -tags  => 'liq_eq',
     );

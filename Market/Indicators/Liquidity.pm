@@ -60,6 +60,10 @@ sub new {
         # de "Sweep" estándar (PDF 4.2: "máximo de 3 velas posteriores")
         grab_max_candles => $args{grab_max_candles} // 3,
 
+        # PDF 4.4 (consumidor): umbral de volumen relativo (vs mediana) por
+        # debajo del cual un nivel se considera "ruido" (no institucional).
+        noise_threshold => $args{noise_threshold} // 0.6,
+
         # ── Resultado de calculate_all() ──────────────────────────────────
         # levels: arrayref cronológico de hashrefs de nivel de liquidez:
         #   {
@@ -212,6 +216,7 @@ sub calculate_all {
     # ── PDF 4.4: jerarquía multi-temporal y peso de volumen ──────────────────
     $self->_calc_mtf_volume($market_data, $data);
     $self->_classify_origin();
+    $self->_calc_volume_weight($data);   # PDF 4.4 consumidor: institucional vs ruido
 }
 # ─────────────────────────────────────────────────────────────────────────────
 # calculate_replay — versión para el sistema Replay
@@ -270,7 +275,10 @@ sub calculate_replay {
     # BSL, SSL, EQH y EQL — completo, ya no hace falta la versión "fast".
     $self->_detect_levels($run_data, $atr);
     $self->_run_state_machine($run_data);
-    # Omitimos _calc_mtf_volume (no afecta el render del Replay)
+    # Omitimos _calc_mtf_volume (no afecta el render del Replay), pero SÍ el
+    # peso de volumen §4.4: usa el volumen de la vela de detección (equivalente
+    # al volume_mtf de 1m) para clasificar institucional/ruido también en Replay.
+    $self->_calc_volume_weight($run_data);
 
     # Recortar el warm-up: descartar niveles detectados enteramente antes
     # de la ventana real y reindexar de vuelta al espacio local de la
@@ -564,6 +572,44 @@ sub _calc_mtf_volume {
             }
             $level->{volume_mtf}{$sub_tf} = $sum;
         }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _calc_volume_weight — PDF 4.4 (CONSUMIDOR): usa el volumen (multi-temporal)
+# como "peso de importancia relativa para filtrar niveles institucionales
+# reales de ruido de mercado".
+#
+# Para cada nivel calcula un vol_score (volumen MTF de 1m si existe; si no —caso
+# de la ventana de Replay, donde no se corre _calc_mtf_volume— cae al volumen de
+# la vela de detección, que es equivalente porque una vela HTF ya agrega el
+# volumen de sus sub-velas). Compara contra la MEDIANA de todos los niveles y
+# marca institutional = (vol_score/mediana >= noise_threshold). El overlay
+# atenúa/oculta los niveles NO institucionales (ruido).
+# ─────────────────────────────────────────────────────────────────────────────
+sub _calc_volume_weight {
+    my ($self, $data) = @_;
+    my $levels = $self->{levels};
+    return unless $levels && @$levels;
+
+    my @scores;
+    for my $lv (@$levels) {
+        my $vs = ($lv->{volume_mtf} && defined $lv->{volume_mtf}{1})
+               ? $lv->{volume_mtf}{1}
+               : (defined $lv->{index} && $data->[ $lv->{index} ]
+                    ? ($data->[ $lv->{index} ]{volume} // 0) : 0);
+        $lv->{vol_score} = $vs;
+        push @scores, $vs;
+    }
+
+    my @sorted = sort { $a <=> $b } @scores;
+    my $m      = int(@sorted / 2);
+    my $median = (@sorted % 2) ? $sorted[$m] : ($sorted[$m - 1] + $sorted[$m]) / 2;
+
+    my $thr = $self->{noise_threshold};
+    for my $lv (@$levels) {
+        $lv->{vol_ratio}     = $median > 0 ? $lv->{vol_score} / $median : 1;
+        $lv->{institutional} = ($lv->{vol_ratio} >= $thr) ? 1 : 0;
     }
 }
 
