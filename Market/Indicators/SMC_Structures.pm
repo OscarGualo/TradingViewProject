@@ -327,6 +327,13 @@ sub values_order_blocks {
     return $self->{order_blocks};
 }
 
+# Order Blocks de un scope concreto: 'internal' (estructura menor) o 'swing'
+# (estructura mayor). Usado por el overlay para dibujar/toggle por separado.
+sub values_order_blocks_by_scope {
+    my ($self, $scope) = @_;
+    return [ grep { ($_->{scope} // 'internal') eq $scope } @{ $self->{order_blocks} } ];
+}
+
 sub values_support_resistance {
     my ($self) = @_;
     return $self->{support_resistance};
@@ -1184,12 +1191,33 @@ sub _detect_order_blocks {
         $pl[$i] = $hv ? $c->{high} : $c->{low};
     }
 
-    # Paso 3: un OB por ruptura de estructura INTERNA (BOS + CHoCH). Bullish ->
-    # bar con MIN parsedLow (demanda); bearish -> bar con MAX parsedHigh (oferta),
-    # dentro de [level_index, event_index) — idéntico a storeOrdeBlock().
+    # Paso 3: un OB por CADA ruptura de estructura, para AMBOS scopes:
+    #   · 'internal' (eventos scope='internal', estructura menor k=depth)  → LuxAlgo Internal OB
+    #   · 'swing'    (eventos scope='external', estructura mayor k=major_depth) → LuxAlgo Swing OB
+    # La imagen SMC Pro [Neon] pide Internal OB OFF + Swing OB ON: ambos sets
+    # existen y el overlay decide cuál dibujar. Bullish -> bar con MIN parsedLow
+    # (demanda); bearish -> bar con MAX parsedHigh (oferta), dentro de
+    # [level_index, event_index) — idéntico a storeOrderBlock() de LuxAlgo.
+    my @obs = (
+        @{ $self->_build_obs_for_scope($data, 'internal', \@ph, \@pl, $n) },
+        @{ $self->_build_obs_for_scope($data, 'swing',    \@ph, \@pl, $n) },
+    );
+
+    @{ $self->{order_blocks} } = @obs;
+    $self->{order_blocks_by_index} = {};
+    $self->{order_blocks_by_index}{ $_->{index} } = $_ for @obs;
+}
+
+# _build_obs_for_scope — construye los Order Blocks de UN scope y les aplica la
+# mitigación estilo LuxAlgo. $scope_tag = 'internal' | 'swing'. El scope de los
+# EVENTOS que lo alimentan es 'internal' para internal-OB y 'external' para
+# swing-OB (major structure). Cada OB devuelto lleva scope => $scope_tag.
+sub _build_obs_for_scope {
+    my ($self, $data, $scope_tag, $ph, $pl, $n) = @_;
+    my $ev_scope = $scope_tag eq 'swing' ? 'external' : 'internal';
     my @obs;
     for my $ev (@{ $self->{events} }) {
-        next unless $ev->{scope} eq 'internal';
+        next unless $ev->{scope} eq $ev_scope;
         my $a = $ev->{level_index};
         my $b = $ev->{index};
         next if !defined $a;
@@ -1199,18 +1227,19 @@ sub _detect_order_blocks {
         my $bullish = ($ev->{direction} eq 'up');
         my $sel = $a;
         if ($bullish) {
-            my $best = $pl[$a];
-            for my $j ($a .. $b - 1) { if ($pl[$j] < $best) { $best = $pl[$j]; $sel = $j; } }
+            my $best = $pl->[$a];
+            for my $j ($a .. $b - 1) { if ($pl->[$j] < $best) { $best = $pl->[$j]; $sel = $j; } }
         } else {
-            my $best = $ph[$a];
-            for my $j ($a .. $b - 1) { if ($ph[$j] > $best) { $best = $ph[$j]; $sel = $j; } }
+            my $best = $ph->[$a];
+            for my $j ($a .. $b - 1) { if ($ph->[$j] > $best) { $best = $ph->[$j]; $sel = $j; } }
         }
 
-        my $top    = $ph[$sel] > $pl[$sel] ? $ph[$sel] : $pl[$sel];
-        my $bottom = $ph[$sel] > $pl[$sel] ? $pl[$sel] : $ph[$sel];
+        my $top    = $ph->[$sel] > $pl->[$sel] ? $ph->[$sel] : $pl->[$sel];
+        my $bottom = $ph->[$sel] > $pl->[$sel] ? $pl->[$sel] : $ph->[$sel];
 
         push @obs, {
             index        => $sel,
+            scope        => $scope_tag,
             direction    => $bullish ? 'bullish' : 'bearish',
             top          => $top,
             bottom       => $bottom,
@@ -1219,9 +1248,9 @@ sub _detect_order_blocks {
         };
     }
 
-    # Paso 4: mitigación estilo LuxAlgo (deleteOrderBlocks): bearish se mitiga
-    # cuando high > OB.top; bullish cuando low < OB.bottom (el precio ATRAVIESA
-    # el bloque). Se busca a partir de la vela siguiente a la ruptura.
+    # Mitigación LuxAlgo (deleteOrderBlocks): bearish se mitiga cuando
+    # high > OB.top; bullish cuando low < OB.bottom (el precio ATRAVIESA el
+    # bloque). Se busca desde la vela siguiente a la ruptura.
     for my $ob (@obs) {
         for (my $j = $ob->{bos_index} + 1; $j < $n; $j++) {
             my $c = $data->[$j];
@@ -1232,9 +1261,7 @@ sub _detect_order_blocks {
         }
     }
 
-    @{ $self->{order_blocks} } = @obs;
-    $self->{order_blocks_by_index} = {};
-    $self->{order_blocks_by_index}{ $_->{index} } = $_ for @obs;
+    return \@obs;
 }
 
 

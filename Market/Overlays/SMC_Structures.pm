@@ -75,7 +75,8 @@ sub new {
             choch      => 0,
             fvg        => 0,
             fib        => 0,
-            ob         => 0,   # Order Blocks
+            ob_internal => 0,  # Internal Order Blocks (estructura menor)
+            ob_swing    => 0,  # Swing Order Blocks (estructura mayor) — LuxAlgo
             sr         => 0,   # Support / Resistance
             trend      => 0,   # Trendlines / Channels
             daily      => 0,   # Near daily candle's body & wick (Fase 4)
@@ -134,7 +135,7 @@ sub draw {
         if $self->{visible}{fib};
 
     $self->_draw_order_blocks($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
-        if $self->{visible}{ob};
+        if $self->{visible}{ob_internal} || $self->{visible}{ob_swing};
 
     $self->_draw_support_resistance($canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h)
         if $self->{visible}{sr};
@@ -569,19 +570,35 @@ sub _draw_fibonacci {
     }
 }
 
-my $OB_MAX_RECENT = 5;   # LuxAlgo internalOrderBlocksSizeInput (default 5)
+my $OB_MAX_INTERNAL = 5;   # LuxAlgo internalOrderBlocksSizeInput (default 5)
+my $OB_MAX_SWING    = 5;   # LuxAlgo swingOrderBlocksSizeInput   (default 5)
 
 sub _draw_order_blocks {
     my ($self, $canvas, $smc, $x_of, $state, $start, $end, $min, $max, $top, $h) = @_;
 
-    # LuxAlgo: sólo los N Order Blocks NO MITIGADOS más recientes (un OB
-    # mitigado se elimina — no se dibuja). Se toman por índice descendente y
-    # se extienden a la derecha (extend right) hasta el borde visible.
-    my $all = $smc->values_order_blocks();
+    # LuxAlgo separa Internal OB (estructura menor) y Swing OB (estructura
+    # mayor), cada uno con su toggle y su cap. La imagen SMC Pro [Neon] pide
+    # Internal OB OFF + Swing OB ON. Swing se dibuja más marcado (stipple más
+    # denso, borde grueso, etiqueta 'OB'); internal más tenue ('iOB').
+    $self->_draw_ob_scope($canvas, $smc, $x_of, $start, $end, $min, $max, $top, $h,
+        'swing', $OB_MAX_SWING, 'gray25', 2, 'OB')
+        if $self->{visible}{ob_swing};
+    $self->_draw_ob_scope($canvas, $smc, $x_of, $start, $end, $min, $max, $top, $h,
+        'internal', $OB_MAX_INTERNAL, 'gray12', 1, 'iOB')
+        if $self->{visible}{ob_internal};
+}
+
+sub _draw_ob_scope {
+    my ($self, $canvas, $smc, $x_of, $start, $end, $min, $max, $top, $h,
+        $scope, $cap, $stipple, $bw, $tag_text) = @_;
+
+    # Sólo los N Order Blocks NO MITIGADOS más recientes del scope (un OB
+    # mitigado se elimina). Índice descendente, extend right hasta el borde.
+    my $all = $smc->values_order_blocks_by_scope($scope);
     return unless $all && @$all;
     my @live = grep { $_->{index} <= $end && !defined $_->{mitigated_at} } @$all;
     @live = sort { $b->{index} <=> $a->{index} } @live;
-    @live = @live[0 .. $OB_MAX_RECENT - 1] if @live > $OB_MAX_RECENT;
+    @live = @live[0 .. $cap - 1] if @live > $cap;
 
     for my $ob (@live) {
         my $i1 = $ob->{index};
@@ -602,14 +619,14 @@ sub _draw_order_blocks {
 
         $canvas->createRectangle($x1, $y_top, $x2, $y_bot,
             -fill    => $color,
-            -stipple => 'gray12',        # semitransparencia (Tk no tiene alpha real)
+            -stipple => $stipple,        # semitransparencia (Tk no tiene alpha real)
             -outline => $color,
-            -width   => 1,
+            -width   => $bw,
             -tags    => 'smc_ob',
         );
         $canvas->createText($x1 + 3, $y_top + 7,
             -anchor => 'w',
-            -text   => 'OB',
+            -text   => $tag_text,
             -fill   => $color,
             -font   => ['Arial', 7, 'bold'],
             -tags   => 'smc_ob',

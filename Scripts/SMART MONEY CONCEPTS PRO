@@ -1,0 +1,740 @@
+//@version=6
+// This work is licensed under CC BY-NC-SA 4.0 — https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo (original Smart Money Concepts)
+// v6 conversion, bug fixes, optimization, and Neon UI upgrade
+indicator('Smart Money Concepts Pro [Neon]', 'SMC Pro', overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════════════════
+BULLISH_LEG = 1
+BEARISH_LEG = 0
+BULLISH     =  1
+BEARISH     = -1
+
+HISTORICAL = 'Historical'
+PRESENT    = 'Present'
+ALL        = 'All'
+BOS_S      = 'BOS'
+CHOCH_S    = 'CHoCH'
+ATR_S      = 'ATR'
+RANGE_S    = 'Cumulative Mean Range'
+CLOSE_S    = 'Close'
+HIGHLOW    = 'High / Low'
+SOLID      = '⎯⎯⎯'
+DASHED     = '----'
+DOTTED     = '····'
+
+THEME_NEON    = 'Futuristic Neon'
+THEME_PRO     = 'Modern Professional'
+THEME_MINIMAL = 'Minimal Clean'
+
+ACC_CYAN   = 'Neon Cyan'
+ACC_PURPLE = 'Cyberpunk Purple'
+ACC_PINK   = 'Hot Pink'
+ACC_BLUE   = 'Electric Blue'
+ACC_LIME   = 'Lime Green'
+
+SZ_TINY   = 'Tiny'
+SZ_SMALL  = 'Small'
+SZ_NORMAL = 'Normal'
+
+GEN  = 'General Settings'
+SIG  = 'Signal Settings'
+OBG  = 'Order Blocks'
+EQG  = 'Equal Highs / Lows'
+FVGG = 'Fair Value Gaps'
+MTFG = 'MTF Levels'
+PDZG = 'Premium / Discount Zones'
+THM  = 'Visual Theme'
+ADV  = 'Advanced Settings'
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUTS — General
+// ════════════════════════════════════════════════════════════════════════════
+modeInp       = input.string(HISTORICAL, 'Display Mode', options=[HISTORICAL, PRESENT], group=GEN,
+     tooltip='Historical: show all past structures. Present: only the most recent.')
+colorBarsInp  = input.bool(false, 'Color Candles by Trend', group=GEN)
+showSwingsInp = input.bool(false, 'Show Swing Point Labels (HH/HL/LH/LL)', group=GEN)
+showHLInp     = input.bool(true,  'Show Strong / Weak High & Low', group=GEN)
+
+// INPUTS — Signal: Internal
+showIntInp       = input.bool(true, 'Show Internal Structure', group=SIG)
+intBullFilterInp = input.string(ALL, 'Internal Bullish Filter', options=[ALL,BOS_S,CHOCH_S], group=SIG)
+intBearFilterInp = input.string(ALL, 'Internal Bearish Filter', options=[ALL,BOS_S,CHOCH_S], group=SIG)
+intConflInp      = input.bool(false,'Internal Confluence Filter', group=SIG,
+     tooltip='Filters internal BOS/CHoCH on indecisive candles.')
+intLblSzInp      = input.string(SZ_TINY, 'Internal Label Size', options=[SZ_TINY,SZ_SMALL,SZ_NORMAL], group=SIG)
+
+// INPUTS — Signal: Swing
+showSwInp       = input.bool(true, 'Show Swing Structure', group=SIG)
+swBullFilterInp = input.string(ALL, 'Swing Bullish Filter', options=[ALL,BOS_S,CHOCH_S], group=SIG)
+swBearFilterInp = input.string(ALL, 'Swing Bearish Filter', options=[ALL,BOS_S,CHOCH_S], group=SIG)
+swLenInp        = input.int(50, 'Swing Length (bars)', minval=10, group=SIG)
+swLblSzInp      = input.string(SZ_SMALL,'Swing Label Size', options=[SZ_TINY,SZ_SMALL,SZ_NORMAL], group=SIG)
+
+// INPUTS — Order Blocks
+showIntOBInp = input.bool(true,  'Show Internal Order Blocks', group=OBG)
+intOBCntInp  = input.int(5, 'Internal OB Count', minval=1, maxval=20, group=OBG)
+showSwOBInp  = input.bool(false, 'Show Swing Order Blocks', group=OBG)
+swOBCntInp   = input.int(5, 'Swing OB Count', minval=1, maxval=20, group=OBG)
+obFilterInp  = input.string(ATR_S, 'OB Volatility Filter', options=[ATR_S,RANGE_S], group=OBG,
+     tooltip='Use Cumulative Mean Range when little historical data is available.')
+obMitigInp   = input.string(HIGHLOW, 'OB Mitigation Source', options=[CLOSE_S,HIGHLOW], group=OBG)
+
+// INPUTS — Equal H/L
+showEQInp   = input.bool(true, 'Show Equal Highs / Lows', group=EQG)
+eqLenInp    = input.int(3, 'Confirmation Bars', minval=1, group=EQG)
+eqThreshInp = input.float(0.1, 'Threshold (ATR mult)', minval=0, maxval=0.5, step=0.05, group=EQG,
+     tooltip='Lower = stricter equality detection.')
+eqLblSzInp  = input.string(SZ_TINY, 'Label Size', options=[SZ_TINY,SZ_SMALL,SZ_NORMAL], group=EQG)
+
+// INPUTS — Fair Value Gaps
+showFVGInp  = input.bool(false, 'Show Fair Value Gaps', group=FVGG)
+fvgAutoTInp = input.bool(true,  'Auto Threshold (filter weak FVGs)', group=FVGG)
+fvgTFInp    = input.timeframe('', 'FVG Timeframe', group=FVGG,
+     tooltip='Empty = chart timeframe. Higher TFs may repaint until the HTF bar closes.')
+fvgExtInp   = input.int(1, 'FVG Extend (bars)', minval=0, group=FVGG)
+
+// INPUTS — MTF Levels
+showDInp  = input.bool(false, 'Show Daily H/L',   group=MTFG, inline='d')
+dStyleInp = input.string(SOLID, '', options=[SOLID,DASHED,DOTTED], group=MTFG, inline='d')
+showWInp  = input.bool(false, 'Show Weekly H/L',  group=MTFG, inline='w')
+wStyleInp = input.string(SOLID, '', options=[SOLID,DASHED,DOTTED], group=MTFG, inline='w')
+showMInp  = input.bool(false, 'Show Monthly H/L', group=MTFG, inline='m')
+mStyleInp = input.string(SOLID, '', options=[SOLID,DASHED,DOTTED], group=MTFG, inline='m')
+
+// INPUTS — Premium / Discount Zones
+showPDZInp = input.bool(false, 'Show Premium / Discount / Equilibrium', group=PDZG)
+
+// INPUTS — Visual Theme
+themeInp         = input.string(THEME_NEON, 'Theme',
+     options=[THEME_NEON,THEME_PRO,THEME_MINIMAL], group=THM,
+     tooltip='Switches the entire color palette and visual styling.')
+neonBullAccInp   = input.string(ACC_CYAN, 'Neon Bullish Accent',
+     options=[ACC_CYAN,ACC_LIME,ACC_BLUE], group=THM)
+neonBearAccInp   = input.string(ACC_PINK, 'Neon Bearish Accent',
+     options=[ACC_PINK,ACC_PURPLE], group=THM)
+glowCloudInp     = input.bool(true,  'Soft Glow Clouds on Zones', group=THM,
+     tooltip='Raises zone transparency for the soft glow effect.')
+gradientTrendInp = input.bool(true,  'Gradient Trend-Strength Coloring', group=THM,
+     tooltip='Structure lines fade between weak/strong shades based on break magnitude.')
+useCustomColInp  = input.bool(false, 'Use Custom Bull / Bear Colors', group=THM)
+customBullInp    = input.color(#00ffd5, 'Custom Bullish', group=THM)
+customBearInp    = input.color(#ff3a8c, 'Custom Bearish', group=THM)
+
+// INPUTS — Advanced
+atrLenInp = input.int(200, 'ATR Length (volatility / OB filter)', minval=10, group=ADV)
+
+// ════════════════════════════════════════════════════════════════════════════
+// THEME RESOLUTION
+// ════════════════════════════════════════════════════════════════════════════
+neonBullCol = neonBullAccInp == ACC_CYAN ? #00ffd5 : neonBullAccInp == ACC_LIME ? #39ff14 : #00d4ff
+neonBearCol = neonBearAccInp == ACC_PINK ? #ff3a8c : #b537f2
+
+themeBull = useCustomColInp ? customBullInp
+     : themeInp == THEME_NEON ? neonBullCol
+     : themeInp == THEME_PRO  ? #2962ff
+     : #b2b5be
+
+themeBear = useCustomColInp ? customBearInp
+     : themeInp == THEME_NEON ? neonBearCol
+     : themeInp == THEME_PRO  ? #ff5252
+     : #5d606b
+
+accentCol  = themeInp == THEME_NEON ? #00d4ff : themeInp == THEME_PRO ? #4a90e2 : #878b94
+neutralCol = themeInp == THEME_NEON ? color.rgb(170,175,200) : #878b94
+
+// Internal vs swing (internals slightly dimmer)
+intBullCol = color.new(themeBull, 25)
+intBearCol = color.new(themeBear, 25)
+swBullCol  = themeBull
+swBearCol  = themeBear
+
+// OB / FVG / Zone transparencies (glow cloud)
+obT      = glowCloudInp ? 87 : 75
+fvgT     = glowCloudInp ? 82 : 70
+zoneT    = glowCloudInp ? 90 : 78
+
+intBullOB   = color.new(themeBull, obT + 1)
+intBearOB   = color.new(themeBear, obT + 1)
+swBullOB    = color.new(themeBull, obT - 6)
+swBearOB    = color.new(themeBear, obT - 6)
+fvgBullCol  = color.new(themeBull, fvgT)
+fvgBearCol  = color.new(themeBear, fvgT)
+premCol     = themeBear
+discCol     = themeBull
+eqCol       = neutralCol
+
+// ════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ════════════════════════════════════════════════════════════════════════════
+type alerts
+    bool intBullBOS    = false
+    bool intBearBOS    = false
+    bool intBullCHoCH  = false
+    bool intBearCHoCH  = false
+    bool swBullBOS     = false
+    bool swBearBOS     = false
+    bool swBullCHoCH   = false
+    bool swBearCHoCH   = false
+    bool intBullOBMit  = false
+    bool intBearOBMit  = false
+    bool swBullOBMit   = false
+    bool swBearOBMit   = false
+    bool eqHighs       = false
+    bool eqLows        = false
+    bool bullFVG       = false
+    bool bearFVG       = false
+
+type trailingExtremes
+    float top
+    float bottom
+    int   barTime
+    int   barIndex
+    int   lastTopTime
+    int   lastBottomTime
+
+type fairValueGap
+    float top
+    float bottom
+    int   bias
+    box   topBox
+    box   bottomBox
+
+type trend
+    int bias
+
+type equalDisplay
+    line  l_ine  = na
+    label l_abel = na
+
+type pivot
+    float currentLevel
+    float lastLevel
+    bool  crossed
+    int   barTime  = time
+    int   barIndex = bar_index
+
+type orderBlock
+    float barHigh
+    float barLow
+    int   barTime
+    int   bias
+
+// ════════════════════════════════════════════════════════════════════════════
+// STATE
+// ════════════════════════════════════════════════════════════════════════════
+var pivot swingHigh    = pivot.new(na,na,false)
+var pivot swingLow     = pivot.new(na,na,false)
+var pivot internalHigh = pivot.new(na,na,false)
+var pivot internalLow  = pivot.new(na,na,false)
+var pivot equalHigh    = pivot.new(na,na,false)
+var pivot equalLow     = pivot.new(na,na,false)
+
+var trend swingTrend    = trend.new(0)
+var trend internalTrend = trend.new(0)
+
+var equalDisplay equalHighDisplay = equalDisplay.new()
+var equalDisplay equalLowDisplay  = equalDisplay.new()
+
+var array<fairValueGap> fairValueGaps        = array.new<fairValueGap>()
+var array<float>        parsedHighs          = array.new<float>()
+var array<float>        parsedLows           = array.new<float>()
+var array<float>        highs                = array.new<float>()
+var array<float>        lows                 = array.new<float>()
+var array<int>          times                = array.new<int>()
+var trailingExtremes    trailing             = trailingExtremes.new()
+var array<orderBlock>   swingOrderBlocks     = array.new<orderBlock>()
+var array<orderBlock>   internalOrderBlocks  = array.new<orderBlock>()
+var array<box>          swingOBBoxes         = array.new<box>()
+var array<box>          internalOBBoxes      = array.new<box>()
+var int                 initialTime          = time
+varip int               currentBarIndex      = bar_index
+varip int               lastBarIndex         = bar_index
+
+alerts currentAlerts = alerts.new()
+
+// Pre-allocate OB boxes once
+if barstate.isfirst
+    if showSwOBInp
+        for i = 1 to swOBCntInp
+            swingOBBoxes.push(box.new(na,na,na,na,xloc=xloc.bar_time,extend=extend.right))
+    if showIntOBInp
+        for i = 1 to intOBCntInp
+            internalOBBoxes.push(box.new(na,na,na,na,xloc=xloc.bar_time,extend=extend.right))
+
+// ════════════════════════════════════════════════════════════════════════════
+// PRE-COMPUTED PER-BAR VALUES
+// ════════════════════════════════════════════════════════════════════════════
+bearMitSrc = obMitigInp == CLOSE_S ? close : high
+bullMitSrc = obMitigInp == CLOSE_S ? close : low
+
+atrMeasure       = ta.atr(atrLenInp)
+volMeasure       = obFilterInp == ATR_S ? atrMeasure : ta.cum(ta.tr) / math.max(bar_index, 1)
+highVolatilityBar= (high - low) >= (2 * volMeasure)
+parsedHigh       = highVolatilityBar ? low  : high
+parsedLow        = highVolatilityBar ? high : low
+
+parsedHighs.push(parsedHigh)
+parsedLows.push(parsedLow)
+highs.push(high)
+lows.push(low)
+times.push(time)
+
+// ════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+labelSize(string s) =>
+    s == SZ_TINY ? size.tiny : s == SZ_NORMAL ? size.normal : size.small
+
+lineStyle(string s) =>
+    s == DASHED ? line.style_dashed : s == DOTTED ? line.style_dotted : line.style_solid
+
+// Color faded by trend-strength (break magnitude relative to ATR).
+// Repaint-safe: derived only from already-known data on the current bar.
+strengthCol(color base, float magnitude) =>
+    if not gradientTrendInp
+        base
+    else
+        float r = math.min(magnitude / math.max(atrMeasure, 1e-10), 3.0) / 3.0
+        color.from_gradient(r, 0.0, 1.0, color.new(base, 55), color.new(base, 0))
+
+// Leg detection: 0 = bearish leg, 1 = bullish leg
+leg(int size) =>
+    var int legState = 0
+    bool newHigh = high[size] > ta.highest(size)
+    bool newLow  = low[size]  < ta.lowest(size)
+    if newHigh
+        legState := BEARISH_LEG
+    else if newLow
+        legState := BULLISH_LEG
+    legState
+
+startOfNewLeg(int legV)     => ta.change(legV) != 0
+startOfBearishLeg(int legV) => ta.change(legV) == -1
+startOfBullishLeg(int legV) => ta.change(legV) == +1
+
+drawLabel(int labelTime, float labelPrice, string tag, color textCol, string style) =>
+    var label l = na
+    if modeInp == PRESENT
+        l.delete()
+    l := label.new(chart.point.new(labelTime, na, labelPrice), tag, xloc=xloc.bar_time,
+         color=color(na), textcolor=textCol, style=style, size=size.small)
+
+drawEqualHighLow(pivot p, float level, int size, bool isHigh) =>
+    equalDisplay disp = isHigh ? equalHighDisplay : equalLowDisplay
+    string tag        = isHigh ? 'EQH' : 'EQL'
+    color  col        = isHigh ? swBearCol : swBullCol
+    string lblStyle   = isHigh ? label.style_label_down : label.style_label_up
+
+    if modeInp == PRESENT
+        line.delete(disp.l_ine)
+        label.delete(disp.l_abel)
+
+    disp.l_ine := line.new(
+         chart.point.new(p.barTime, na, p.currentLevel),
+         chart.point.new(time[size], na, level),
+         xloc=xloc.bar_time, color=col, style=line.style_dotted)
+    int lblPos = math.round(0.5 * (p.barIndex + bar_index - size))
+    disp.l_abel := label.new(chart.point.new(na, lblPos, level), tag, xloc=xloc.bar_index,
+         color=color(na), textcolor=col, style=lblStyle, size=labelSize(eqLblSzInp))
+
+// ════════════════════════════════════════════════════════════════════════════
+// STRUCTURE: PIVOT DETECTION & STORAGE
+// ════════════════════════════════════════════════════════════════════════════
+getCurrentStructure(int size, bool equalHL = false, bool internal = false) =>
+    int  legV     = leg(size)
+    bool newPivot = startOfNewLeg(legV)
+    bool isLow    = startOfBullishLeg(legV)
+    bool isHigh   = startOfBearishLeg(legV)
+
+    if newPivot
+        if isLow
+            pivot p = equalHL ? equalLow : internal ? internalLow : swingLow
+            if equalHL and math.abs(p.currentLevel - low[size]) < eqThreshInp * atrMeasure
+                drawEqualHighLow(p, low[size], size, false)
+                currentAlerts.eqLows := true
+            p.lastLevel    := p.currentLevel
+            p.currentLevel := low[size]
+            p.crossed      := false
+            p.barTime      := time[size]
+            p.barIndex     := bar_index[size]
+            if not equalHL and not internal
+                trailing.bottom         := p.currentLevel
+                trailing.barTime        := p.barTime
+                trailing.barIndex       := p.barIndex
+                trailing.lastBottomTime := p.barTime
+            if showSwingsInp and not internal and not equalHL
+                drawLabel(time[size], p.currentLevel,
+                     p.currentLevel < p.lastLevel ? 'LL' : 'HL',
+                     swBullCol, label.style_label_up)
+        else
+            pivot p = equalHL ? equalHigh : internal ? internalHigh : swingHigh
+            if equalHL and math.abs(p.currentLevel - high[size]) < eqThreshInp * atrMeasure
+                drawEqualHighLow(p, high[size], size, true)
+                currentAlerts.eqHighs := true
+            p.lastLevel    := p.currentLevel
+            p.currentLevel := high[size]
+            p.crossed      := false
+            p.barTime      := time[size]
+            p.barIndex     := bar_index[size]
+            if not equalHL and not internal
+                trailing.top         := p.currentLevel
+                trailing.barTime     := p.barTime
+                trailing.barIndex    := p.barIndex
+                trailing.lastTopTime := p.barTime
+            if showSwingsInp and not internal and not equalHL
+                drawLabel(time[size], p.currentLevel,
+                     p.currentLevel > p.lastLevel ? 'HH' : 'LH',
+                     swBearCol, label.style_label_down)
+
+// ════════════════════════════════════════════════════════════════════════════
+// STRUCTURE DRAWING
+// ════════════════════════════════════════════════════════════════════════════
+drawStructure(pivot p, string tag, color structCol, string lStyle, string lblStyle, string lblSize) =>
+    var line  l = line.new(na,na,na,na, xloc=xloc.bar_time)
+    var label b = label.new(na,na)
+    if modeInp == PRESENT
+        l.delete()
+        b.delete()
+    l := line.new(
+         chart.point.new(p.barTime, na, p.currentLevel),
+         chart.point.new(time, na, p.currentLevel),
+         xloc=xloc.bar_time, color=structCol, style=lStyle)
+    b := label.new(
+         chart.point.new(na, math.round(0.5 * (p.barIndex + bar_index)), p.currentLevel),
+         tag, xloc=xloc.bar_index, color=color(na), textcolor=structCol,
+         style=lblStyle, size=lblSize)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ORDER BLOCKS
+// ════════════════════════════════════════════════════════════════════════════
+deleteOrderBlocks(bool internal = false) =>
+    array<orderBlock> obs = internal ? internalOrderBlocks : swingOrderBlocks
+    for [idx, ob] in obs
+        bool crossed = false
+        if bearMitSrc > ob.barHigh and ob.bias == BEARISH
+            crossed := true
+            if internal
+                currentAlerts.intBearOBMit := true
+            else
+                currentAlerts.swBearOBMit := true
+        else if bullMitSrc < ob.barLow and ob.bias == BULLISH
+            crossed := true
+            if internal
+                currentAlerts.intBullOBMit := true
+            else
+                currentAlerts.swBullOBMit := true
+        if crossed
+            obs.remove(idx)
+
+storeOrderBlock(pivot p, bool internal, int bias) =>
+    if (not internal and showSwOBInp) or (internal and showIntOBInp)
+        array<float> arr = na
+        int idx = na
+        if bias == BEARISH
+            arr := parsedHighs.slice(p.barIndex, bar_index)
+            idx := p.barIndex + arr.indexof(arr.max())
+        else
+            arr := parsedLows.slice(p.barIndex, bar_index)
+            idx := p.barIndex + arr.indexof(arr.min())
+        orderBlock ob = orderBlock.new(parsedHighs.get(idx), parsedLows.get(idx), times.get(idx), bias)
+        array<orderBlock> obs = internal ? internalOrderBlocks : swingOrderBlocks
+        if obs.size() >= 100
+            obs.pop()
+        obs.unshift(ob)
+
+drawOrderBlocks(bool internal = false) =>
+    array<orderBlock> obs = internal ? internalOrderBlocks : swingOrderBlocks
+    int n = obs.size()
+    if n > 0
+        int maxOBs = internal ? intOBCntInp : swOBCntInp
+        array<orderBlock> shown = obs.slice(0, math.min(maxOBs, n))
+        array<box> boxes        = internal ? internalOBBoxes : swingOBBoxes
+        for [idx, ob] in shown
+            color c = internal
+                 ? (ob.bias == BEARISH ? intBearOB : intBullOB)
+                 : (ob.bias == BEARISH ? swBearOB  : swBullOB)
+            box b = boxes.get(idx)
+            b.set_top_left_point(    chart.point.new(ob.barTime, na, ob.barHigh))
+            b.set_bottom_right_point(chart.point.new(last_bar_time, na, ob.barLow))
+            b.set_border_color(      internal ? na : c)
+            b.set_bgcolor(           c)
+
+// ════════════════════════════════════════════════════════════════════════════
+// STRUCTURE DETECTION + DISPATCH
+// ════════════════════════════════════════════════════════════════════════════
+displayStructure(bool internal = false) =>
+    bool bullishBar = true
+    bool bearishBar = true
+    if intConflInp
+        bullishBar := high - math.max(close, open) > math.min(close, open - low)
+        bearishBar := high - math.max(close, open) < math.min(close, open - low)
+
+    pivot  p   = internal ? internalHigh : swingHigh
+    trend  t   = internal ? internalTrend : swingTrend
+    string ls  = internal ? line.style_dashed : line.style_solid
+    string sz  = internal ? intLblSzInp : swLblSzInp
+    string sztk= labelSize(sz)
+
+    bool   extraBull = internal ? (internalHigh.currentLevel != swingHigh.currentLevel and bullishBar) : true
+    color  bullBase  = internal ? intBullCol : swBullCol
+    string bullFilt  = internal ? intBullFilterInp : swBullFilterInp
+    bool   showCat   = internal ? showIntInp : showSwInp
+
+    if ta.crossover(close, p.currentLevel) and not p.crossed and extraBull
+        string tag = t.bias == BEARISH ? CHOCH_S : BOS_S
+        if internal
+            currentAlerts.intBullCHoCH := tag == CHOCH_S
+            currentAlerts.intBullBOS   := tag == BOS_S
+        else
+            currentAlerts.swBullCHoCH  := tag == CHOCH_S
+            currentAlerts.swBullBOS    := tag == BOS_S
+        p.crossed := true
+        t.bias    := BULLISH
+        bool show = showCat and (bullFilt == ALL or (bullFilt == BOS_S and tag != CHOCH_S) or (bullFilt == CHOCH_S and tag == CHOCH_S))
+        if show
+            color c = strengthCol(bullBase, math.abs(close - p.currentLevel))
+            drawStructure(p, tag, c, ls, label.style_label_down, sztk)
+        if (internal and showIntOBInp) or (not internal and showSwOBInp)
+            storeOrderBlock(p, internal, BULLISH)
+
+    // bearish branch
+    p             := internal ? internalLow : swingLow
+    bool extraBear= internal ? (internalLow.currentLevel != swingLow.currentLevel and bearishBar) : true
+    color bearBase= internal ? intBearCol : swBearCol
+    string bearFilt = internal ? intBearFilterInp : swBearFilterInp
+
+    if ta.crossunder(close, p.currentLevel) and not p.crossed and extraBear
+        string tag = t.bias == BULLISH ? CHOCH_S : BOS_S
+        if internal
+            currentAlerts.intBearCHoCH := tag == CHOCH_S
+            currentAlerts.intBearBOS   := tag == BOS_S
+        else
+            currentAlerts.swBearCHoCH  := tag == CHOCH_S
+            currentAlerts.swBearBOS    := tag == BOS_S
+        p.crossed := true
+        t.bias    := BEARISH
+        bool show = showCat and (bearFilt == ALL or (bearFilt == BOS_S and tag != CHOCH_S) or (bearFilt == CHOCH_S and tag == CHOCH_S))
+        if show
+            color c = strengthCol(bearBase, math.abs(close - p.currentLevel))
+            drawStructure(p, tag, c, ls, label.style_label_up, sztk)
+        if (internal and showIntOBInp) or (not internal and showSwOBInp)
+            storeOrderBlock(p, internal, BEARISH)
+
+// ════════════════════════════════════════════════════════════════════════════
+// FAIR VALUE GAPS
+// Note: when fvgTFInp > chart TF, request.security() with lookahead_on may
+// repaint until the current HTF bar closes (TradingView limitation).
+// ════════════════════════════════════════════════════════════════════════════
+fvgBox(int leftTime, int rightTime, float topPrice, float bottomPrice, color c) =>
+    box.new(
+         chart.point.new(leftTime, na, topPrice),
+         chart.point.new(rightTime + fvgExtInp * (time - time[1]), na, bottomPrice),
+         xloc=xloc.bar_time, border_color=c, bgcolor=c)
+
+deleteFairValueGaps() =>
+    for [idx, fvg] in fairValueGaps
+        if (low < fvg.bottom and fvg.bias == BULLISH) or (high > fvg.top and fvg.bias == BEARISH)
+            fvg.topBox.delete()
+            fvg.bottomBox.delete()
+            fairValueGaps.remove(idx)
+
+drawFairValueGaps() =>
+    [lastClose, lastOpen, lastTime, curHigh, curLow, curTime, last2High, last2Low] =
+         request.security(syminfo.tickerid, fvgTFInp,
+              [close[1], open[1], time[1], high[0], low[0], time[0], high[2], low[2]],
+              lookahead = barmerge.lookahead_on)
+
+    float deltaPct = (lastClose - lastOpen) / (lastOpen * 100)
+    bool  newTF    = timeframe.change(fvgTFInp)
+    float thresh   = fvgAutoTInp ? ta.cum(math.abs(newTF ? deltaPct : 0.0)) / math.max(bar_index, 1) * 2 : 0.0
+
+    bool bullFVG = curLow  > last2High and lastClose > last2High and  deltaPct > thresh and newTF
+    bool bearFVG = curHigh < last2Low  and lastClose < last2Low  and -deltaPct > thresh and newTF
+
+    if bullFVG
+        currentAlerts.bullFVG := true
+        float mid = math.avg(curLow, last2High)
+        fairValueGaps.unshift(fairValueGap.new(curLow, last2High, BULLISH,
+             fvgBox(lastTime, curTime, curLow,   mid,        fvgBullCol),
+             fvgBox(lastTime, curTime, mid,      last2High,  fvgBullCol)))
+    if bearFVG
+        currentAlerts.bearFVG := true
+        float mid = math.avg(curHigh, last2Low)
+        fairValueGaps.unshift(fairValueGap.new(curHigh, last2Low, BEARISH,
+             fvgBox(lastTime, curTime, curHigh,  mid,        fvgBearCol),
+             fvgBox(lastTime, curTime, mid,      last2Low,   fvgBearCol)))
+
+// ════════════════════════════════════════════════════════════════════════════
+// MTF LEVELS
+// ════════════════════════════════════════════════════════════════════════════
+higherTimeframe(string tf) => timeframe.in_seconds() > timeframe.in_seconds(tf)
+
+drawLevels(string tf, bool sameTF, string style, color col) =>
+    [topLvl, botLvl, lTime, rTime] = request.security(syminfo.tickerid, tf,
+         [high[1], low[1], time[1], time], lookahead=barmerge.lookahead_on)
+
+    float parsedTop = sameTF ? high : topLvl
+    float parsedBot = sameTF ? low  : botLvl
+    int   pLeft     = sameTF ? time : lTime
+    int   pRight    = sameTF ? time : rTime
+    int   topTime   = time
+    int   botTime   = time
+
+    if not sameTF
+        int lIdx = times.binary_search_rightmost(pLeft)
+        int rIdx = times.binary_search_rightmost(pRight)
+        array<int>   tArr  = times.slice(lIdx, rIdx)
+        array<float> topA  = highs.slice(lIdx, rIdx)
+        array<float> botA  = lows.slice(lIdx, rIdx)
+        topTime := tArr.size() > 0 ? tArr.get(topA.indexof(topA.max())) : initialTime
+        botTime := tArr.size() > 0 ? tArr.get(botA.indexof(botA.min())) : initialTime
+
+    var line  topL = line.new(na,na,na,na, xloc=xloc.bar_time, color=col, style=lineStyle(style))
+    var line  botL = line.new(na,na,na,na, xloc=xloc.bar_time, color=col, style=lineStyle(style))
+    var label topB = label.new(na,na, xloc=xloc.bar_time,
+         text=str.format('P{0}H', tf), color=color(na), textcolor=col,
+         size=size.small, style=label.style_label_left)
+    var label botB = label.new(na,na, xloc=xloc.bar_time,
+         text=str.format('P{0}L', tf), color=color(na), textcolor=col,
+         size=size.small, style=label.style_label_left)
+
+    int rEnd = last_bar_time + 20 * (time - time[1])
+    topL.set_first_point( chart.point.new(topTime, na, parsedTop))
+    topL.set_second_point(chart.point.new(rEnd,    na, parsedTop))
+    topB.set_point(       chart.point.new(rEnd,    na, parsedTop))
+    botL.set_first_point( chart.point.new(botTime, na, parsedBot))
+    botL.set_second_point(chart.point.new(rEnd,    na, parsedBot))
+    botB.set_point(       chart.point.new(rEnd,    na, parsedBot))
+
+// ════════════════════════════════════════════════════════════════════════════
+// TRAILING SWINGS / PREMIUM-DISCOUNT
+// ════════════════════════════════════════════════════════════════════════════
+updateTrailingExtremes() =>
+    trailing.top            := math.max(high, trailing.top)
+    trailing.lastTopTime    := trailing.top    == high ? time : trailing.lastTopTime
+    trailing.bottom         := math.min(low,  trailing.bottom)
+    trailing.lastBottomTime := trailing.bottom == low  ? time : trailing.lastBottomTime
+
+drawHighLowSwings() =>
+    var line  topLn = line.new(na,na,na,na,  color=swBearCol, xloc=xloc.bar_time)
+    var line  botLn = line.new(na,na,na,na,  color=swBullCol, xloc=xloc.bar_time)
+    var label topLb = label.new(na,na, color=color(na), textcolor=swBearCol,
+         xloc=xloc.bar_time, style=label.style_label_down, size=size.tiny)
+    var label botLb = label.new(na,na, color=color(na), textcolor=swBullCol,
+         xloc=xloc.bar_time, style=label.style_label_up,   size=size.tiny)
+
+    int rEnd = last_bar_time + 20 * (time - time[1])
+    topLn.set_first_point( chart.point.new(trailing.lastTopTime, na, trailing.top))
+    topLn.set_second_point(chart.point.new(rEnd,                 na, trailing.top))
+    topLb.set_point(       chart.point.new(rEnd,                 na, trailing.top))
+    topLb.set_text(        swingTrend.bias == BEARISH ? 'Strong High' : 'Weak High')
+
+    botLn.set_first_point( chart.point.new(trailing.lastBottomTime, na, trailing.bottom))
+    botLn.set_second_point(chart.point.new(rEnd,                    na, trailing.bottom))
+    botLb.set_point(       chart.point.new(rEnd,                    na, trailing.bottom))
+    botLb.set_text(        swingTrend.bias == BULLISH ? 'Strong Low' : 'Weak Low')
+
+drawZone(float lblLvl, int lblIdx, float top, float bot, string tag, color zCol, string style) =>
+    var label l = label.new(na,na, text=tag, color=color(na), textcolor=zCol,
+         style=style, size=size.small)
+    var box   b = box.new(na,na,na,na, bgcolor=color.new(zCol, zoneT),
+         border_color=color(na), xloc=xloc.bar_time)
+    b.set_top_left_point(    chart.point.new(trailing.barTime,  na, top))
+    b.set_bottom_right_point(chart.point.new(last_bar_time,     na, bot))
+    l.set_point(             chart.point.new(na, lblIdx, lblLvl))
+
+drawPremiumDiscountZones() =>
+    drawZone(trailing.top, math.round(0.5 * (trailing.barIndex + last_bar_index)),
+         trailing.top, 0.95 * trailing.top + 0.05 * trailing.bottom,
+         'Premium', premCol, label.style_label_down)
+    float eqLvl = math.avg(trailing.top, trailing.bottom)
+    drawZone(eqLvl, last_bar_index,
+         0.525 * trailing.top    + 0.475 * trailing.bottom,
+         0.525 * trailing.bottom + 0.475 * trailing.top,
+         'Equilibrium', eqCol, label.style_label_left)
+    drawZone(trailing.bottom, math.round(0.5 * (trailing.barIndex + last_bar_index)),
+         0.95 * trailing.bottom + 0.05 * trailing.top, trailing.bottom,
+         'Discount', discCol, label.style_label_up)
+
+// ════════════════════════════════════════════════════════════════════════════
+// MAIN EXECUTION
+// ════════════════════════════════════════════════════════════════════════════
+float parsedOpen = colorBarsInp ? open : na
+color candleCol  = internalTrend.bias == BULLISH ? swBullCol : swBearCol
+plotcandle(parsedOpen, high, low, close, color=candleCol, wickcolor=candleCol, bordercolor=candleCol)
+
+if showHLInp or showPDZInp
+    updateTrailingExtremes()
+    if showHLInp
+        drawHighLowSwings()
+    if showPDZInp
+        drawPremiumDiscountZones()
+
+if showFVGInp
+    deleteFairValueGaps()
+
+getCurrentStructure(swLenInp, false, false)
+getCurrentStructure(5,        false, true)
+
+if showEQInp
+    getCurrentStructure(eqLenInp, true, false)
+
+if showIntInp or showIntOBInp or colorBarsInp
+    displayStructure(true)
+
+if showSwInp or showSwOBInp or showHLInp
+    displayStructure(false)
+
+if showIntOBInp
+    deleteOrderBlocks(true)
+if showSwOBInp
+    deleteOrderBlocks(false)
+
+if showFVGInp
+    drawFairValueGaps()
+
+if barstate.islastconfirmedhistory or barstate.islast
+    if showIntOBInp
+        drawOrderBlocks(true)
+    if showSwOBInp
+        drawOrderBlocks(false)
+
+lastBarIndex    := currentBarIndex
+currentBarIndex := bar_index
+bool newBar = currentBarIndex != lastBarIndex
+
+if barstate.islastconfirmedhistory or (barstate.isrealtime and newBar)
+    if showDInp and not higherTimeframe('D')
+        drawLevels('D', timeframe.isdaily,   dStyleInp, accentCol)
+    if showWInp and not higherTimeframe('W')
+        drawLevels('W', timeframe.isweekly,  wStyleInp, accentCol)
+    if showMInp and not higherTimeframe('M')
+        drawLevels('M', timeframe.ismonthly, mStyleInp, accentCol)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(currentAlerts.intBullBOS,   'Internal Bullish BOS',    'Internal Bullish BOS formed')
+alertcondition(currentAlerts.intBearBOS,   'Internal Bearish BOS',    'Internal Bearish BOS formed')
+alertcondition(currentAlerts.intBullCHoCH, 'Internal Bullish CHoCH',  'Internal Bullish CHoCH formed')
+alertcondition(currentAlerts.intBearCHoCH, 'Internal Bearish CHoCH',  'Internal Bearish CHoCH formed')
+
+alertcondition(currentAlerts.swBullBOS,    'Swing Bullish BOS',       'Swing Bullish BOS formed')
+alertcondition(currentAlerts.swBearBOS,    'Swing Bearish BOS',       'Swing Bearish BOS formed')
+alertcondition(currentAlerts.swBullCHoCH,  'Swing Bullish CHoCH',     'Swing Bullish CHoCH formed')
+alertcondition(currentAlerts.swBearCHoCH,  'Swing Bearish CHoCH',     'Swing Bearish CHoCH formed')
+
+alertcondition(currentAlerts.intBullOBMit, 'Internal Bullish OB Mitigated', 'Price mitigated a bullish internal order block')
+alertcondition(currentAlerts.intBearOBMit, 'Internal Bearish OB Mitigated', 'Price mitigated a bearish internal order block')
+alertcondition(currentAlerts.swBullOBMit,  'Swing Bullish OB Mitigated',    'Price mitigated a bullish swing order block')
+alertcondition(currentAlerts.swBearOBMit,  'Swing Bearish OB Mitigated',    'Price mitigated a bearish swing order block')
+
+alertcondition(currentAlerts.eqHighs,      'Equal Highs',  'Equal highs detected')
+alertcondition(currentAlerts.eqLows,       'Equal Lows',   'Equal lows detected')
+
+alertcondition(currentAlerts.bullFVG,      'Bullish FVG',  'Bullish fair value gap formed')
+alertcondition(currentAlerts.bearFVG,      'Bearish FVG',  'Bearish fair value gap formed')

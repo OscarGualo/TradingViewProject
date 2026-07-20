@@ -16,6 +16,7 @@ use Market::Indicators::ZigZagVolume;
 use Market::Overlays::ZigZag;
 use Market::Overlays::VWAP;
 use Market::Overlays::VolumeProfile;
+use Market::Overlays::SupplyDemand;
 
 sub new {
     my ($class, %args) = @_;
@@ -47,6 +48,8 @@ sub new {
         avwap_types   => {                  # anclajes automáticos activos
             session => 0, open => 0, bos => 0, choch => 0, poc => 0,
         },
+        # Supply/Demand Zones (DIY Custom Strategy Builder [ZP]):
+        sd_overlay => Market::Overlays::SupplyDemand->new(),
         # AVP — Perfil de Volumen Anclado multipivot (fiel a TradingView):
         avp_overlay => Market::Overlays::VolumeProfile->new(),
         avp_picking => 0,                   # modo "clic para anclar" (manual)
@@ -205,7 +208,7 @@ sub run {
 
     my %smc_var = (
         swings => 0, bos => 0, choch => 0, fvg => 0, fib => 0,
-        ob => 0, sr => 0, trend => 0,
+        ob_internal => 0, ob_swing => 0, sr => 0, trend => 0,
         strongweak => 0, mtf_d => 0, mtf_w => 0, mtf_m => 0,
         reversal => 0,
     );
@@ -215,7 +218,8 @@ sub run {
         choch      => 'CHoCH',
         fvg        => 'FVG',
         fib        => 'Fibonacci',
-        ob         => 'Order Blocks',
+        ob_swing    => 'Swing OB',
+        ob_internal => 'Internal OB',
         sr         => 'Support / Resistance',
         trend      => 'Trendlines / Channels',
         strongweak => 'Strong / Weak H/L',
@@ -224,7 +228,7 @@ sub run {
         mtf_m      => 'MTF Mensual',
         reversal   => 'Reversal (Grab)',
     );
-    my @smc_order = qw(swings bos choch fvg fib ob sr trend strongweak mtf_d mtf_w mtf_m reversal);
+    my @smc_order = qw(swings bos choch fvg fib ob_swing ob_internal sr trend strongweak mtf_d mtf_w mtf_m reversal);
 
     my %liq_var = (
         bsl => 0, ssl => 0, eqh => 0, eql => 0, sweep => 0, grab => 0, run => 0,
@@ -291,6 +295,33 @@ sub run {
         )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
     }
 
+    # ── Supply/Demand Zones (DIY Custom Strategy Builder [ZP]) ───────────
+    my %sd_var = (zones => 0, poi => 0, bos => 0);
+    my %sd_menu_label = (
+        zones => 'Zonas Supply/Demand',
+        poi   => 'POI',
+        bos   => 'BOS (zona rota)',
+    );
+    my $sd_box = $ov_win->Frame(-background => '#1e222d')
+        ->pack(-side => 'left', -anchor => 'n', -padx => 8, -pady => 8, -fill => 'y');
+    $sd_box->Label(-text => 'Supply/Demand', -background => '#1e222d',
+        -foreground => '#00ffff', -font => ['Arial', 9, 'bold'])
+        ->pack(-side => 'top', -anchor => 'w', -pady => [0, 4]);
+    for my $key (qw(zones poi bos)) {
+        my $k = $key;
+        $sd_box->Checkbutton(
+            -text     => $sd_menu_label{$k},
+            -variable => \$sd_var{$k},
+            -onvalue  => 1, -offvalue => 0,
+            -command  => sub {
+                $self->{sd_overlay}->set_visible($k, $sd_var{$k});
+                $self->draw();
+            },
+            -background => '#1e222d', -foreground => '#b2b5be',
+            -activebackground => '#1e222d', -activeforeground => '#ffffff',
+            -selectcolor => '#00ffff', -font => ['Arial', 9], -anchor => 'w',
+        )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    }
 
     # ── ZigZag (dirección interna + externa) ─────────────────────────────
     my %zz_var = (zzmtf => 0, zzvolume => 0);
@@ -1578,6 +1609,12 @@ sub set_timeframe {
     my $atr = $self->{indicators}->get_indicator('ATR');
     $atr->calculate_all($self->{market}) if defined $atr;
 
+    # Supply/Demand es causal igual que el ATR (pivots con lookback fijo,
+    # rotura por close): recalcular sobre el market completo es válido también
+    # en Replay — el overlay recorta por end_index (zonas nacidas <= cursor).
+    my $sd = $self->{indicators}->get_indicator('SupplyDemand');
+    $sd->calculate_all($self->{market}) if defined $sd;
+
     # AVWAP: reproyectar los anchors manuales a la nueva TF por epoch. El
     # recálculo real (con la lista reconstruida) ocurre en _replay_recalc_
     # indicators (replay) o update_last->..._recalc_avwap más abajo.
@@ -1791,6 +1828,9 @@ sub draw {
 
     my $vp_ind = $self->{indicators}->get_indicator('VolumeProfile');
     $self->{avp_overlay}->draw($c, $vp_ind, $x_of, \%state) if defined $vp_ind;
+
+    my $sd_ind = $self->{indicators}->get_indicator('SupplyDemand');
+    $self->{sd_overlay}->draw($c, $sd_ind, $x_of, \%state) if defined $sd_ind;
 
     # Limpia el área del ATR para ocultar cualquier vela/volumen que se haya pasado.
     $c->createRectangle(

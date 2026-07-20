@@ -14,6 +14,7 @@ use Market::Indicators::ZigZagMTF;
 use Market::Indicators::ZigZagVolume;
 use Market::Indicators::VWAP;
 use Market::Indicators::VolumeProfile;
+use Market::Indicators::SupplyDemand;
 use Market::ChartEngine;
 
 # ─── Resolución de archivos CSV ──────────────────────────────────────────────
@@ -100,6 +101,9 @@ $indicators->register('VWAP', Market::Indicators::VWAP->new());
 # Anchored Volume Profile — arranca SIN perfiles (no dibuja nada hasta que el
 # usuario ancla con el botón "Perfil Volumen").
 $indicators->register('VolumeProfile', Market::Indicators::VolumeProfile->new());
+# Supply/Demand Zones (DIY Custom Strategy Builder [ZP]) — defaults del script:
+# Swing Length=10, History=20, Box Width=2.5, ATR(50).
+$indicators->register('SupplyDemand', Market::Indicators::SupplyDemand->new());
 $indicators->update_last($market);
 
 $loading->destroy;
