@@ -36,7 +36,7 @@ if (@ARGV) {
         "$FindBin::Bin/2026_04.csv",
         "$FindBin::Bin/2026_05.csv",
         "$FindBin::Bin/2026_06.csv",
-        "$FindBin::Bin/2026_07_13.csv",
+        "$FindBin::Bin/2026_07_20.csv",
     );
     for my $f (@candidates) {
         push @csv_files, $f if -f $f;
