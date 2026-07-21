@@ -135,8 +135,16 @@ sub calculate_all {
             for my $z (@$live) {
                 if ($hit->($z)) {
                     $z->{broken_at} = $i;
-                    push @bos, { kind => $z->{kind}, poi => $z->{poi},
-                                 from_index => $z->{created_index}, broken_at => $i };
+                    push @bos, {
+    kind       => $z->{kind},
+    poi        => $z->{poi},
+    from_index =>
+        defined $z->{pivot_index}
+        ? $z->{pivot_index}
+        : $z->{created_index},
+
+    broken_at  => $i
+};
                 } else {
                     push @keep, $z;
                 }

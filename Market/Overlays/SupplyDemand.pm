@@ -84,7 +84,12 @@ sub draw {
                 my $y_top = $y_of->($z->{top});
                 my $y_bot = $y_of->($z->{bottom});
                 next if $y_bot < $top || $y_top > $top + $h;   # fuera del panel
-                my $x1 = $x_at->($z->{created_index});
+                my $zone_start_index =
+    			defined $z->{pivot_index}
+    			? $z->{pivot_index}
+   			 : $z->{created_index};
+
+		my $x1 = $x_at->($zone_start_index);
                 my $x2 = $right;                                # extend right
                 next if $x2 - $x1 < 2;
 
