@@ -55,11 +55,24 @@ sub new {
         # Strategy Builder: SuperTrend / HalfTrend / Range Filter (DIY [ZP]):
         sb_overlay => Market::Overlays::StrategyBuilder->new(),
         # AVP — Perfil de Volumen Anclado multipivot (fiel a TradingView):
-        avp_overlay => Market::Overlays::VolumeProfile->new(),
-        # SVP — Perfil de Volumen de Sesión (un histograma por día):
-        svp_overlay => Market::Overlays::SessionVolumeProfile->new(),
-        avp_picking => 0,                   # modo "clic para anclar" (manual)
-        avp_manual  => [],                  # lista de índices globales anclados a mano
+	avp_overlay => Market::Overlays::VolumeProfile->new(),
+
+	# SVP — Perfil de Volumen de Sesión (un histograma por día):
+	svp_overlay => Market::Overlays::SessionVolumeProfile->new(),
+
+	# Anclaje manual del Perfil de Volumen.
+	avp_picking => 0,
+	avp_manual  => [],
+
+	# Modos automáticos pendientes del Perfil de Volumen:
+	#   bos         => ancla el perfil al último BOS externo confirmado.
+	#   choch       => ancla el perfil al último CHoCH externo confirmado.
+	#   contingency => permite usar el fallback de pasado lejano.
+	avp_types => {
+   	bos         => 0,
+    	choch       => 0,
+   	contingency => 1,
+	},
 
         # ── Estado del sistema Replay (Fase 2) ───────────────────────────────
         # replay_mode   : 0 = normal, 1 = en modo replay activo
@@ -510,6 +523,66 @@ sub run {
         -activeforeground => '#ffffff', -activebackground => '#3a3e49', -cursor => 'hand2',
         -command => sub { $self->avp_clear(); },
     )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [0, 6]);
+
+    # ── Anclajes automáticos del Volume Profile ──────────────────────────
+
+    $avp_box->Label(
+        -text       => 'Anclajes automáticos:',
+        -background => '#1e222d',
+        -foreground => '#787b86',
+        -font       => ['Arial', 8, 'bold'],
+    )->pack(
+        -side   => 'top',
+        -anchor => 'w',
+        -pady   => [2, 2],
+    );
+
+    my %avp_auto_var = (
+        bos   => $self->{avp_types}{bos}   // 0,
+        choch => $self->{avp_types}{choch} // 0,
+    );
+
+    my %avp_auto_label = (
+        bos   => 'Por BOS externo',
+        choch => 'Por CHoCH externo',
+    );
+
+    for my $key (qw(bos choch)) {
+
+        # Se guarda una copia por iteración para que el callback
+        # utilice el checkbox correcto.
+        my $current_key = $key;
+
+        $avp_box->Checkbutton(
+            -text =>
+                $avp_auto_label{$current_key},
+
+            -variable =>
+                \$avp_auto_var{$current_key},
+
+            -onvalue  => 1,
+            -offvalue => 0,
+
+            -command => sub {
+                $self->avp_toggle_type(
+                    $current_key,
+                    $avp_auto_var{$current_key}
+                );
+            },
+
+            -background       => '#1e222d',
+            -foreground       => '#b2b5be',
+            -activebackground => '#1e222d',
+            -activeforeground => '#ffffff',
+            -selectcolor      => '#22d3ee',
+            -font             => ['Arial', 8],
+            -anchor           => 'w',
+        )->pack(
+            -side   => 'top',
+            -anchor => 'w',
+            -fill   => 'x',
+        );
+    }
 
     # Modo de volumen: Máx/Mín (updown) | Total | Delta.
     $avp_box->Label(-text => 'Volumen:', -background => '#1e222d',
@@ -1368,6 +1441,85 @@ sub _event_anchor {
     return $best;
 }
 
+# Devuelve el índice del evento estructural EXTERNO más reciente
+# del tipo indicado, siempre que ocurra antes o en el límite visible.
+#
+# Se crea un resolver nuevo para no modificar _event_anchor(), porque ese
+# método ya es utilizado por el Anchored VWAP.
+sub _avp_external_event_anchor {
+    my ($self, $limit, $type) = @_;
+
+    return undef unless defined $limit;
+    return undef if $limit < 0;
+
+    my $smc =
+        $self->{indicators}->get_indicator('SMC_Structures');
+
+    return undef unless defined $smc;
+    return undef unless $smc->can('values_events');
+
+    my $best;
+
+    for my $event (@{ $smc->values_events() }) {
+
+        next unless defined $event->{type};
+        next unless $event->{type} eq $type;
+
+        # Para aproximar los eventos HTF se utilizan únicamente
+        # eventos estructurales externos.
+        next unless defined $event->{scope};
+        next unless $event->{scope} eq 'external';
+
+        next unless defined $event->{index};
+        next if $event->{index} > $limit;
+
+        if (
+            !defined $best
+            || $event->{index} > $best
+        ) {
+            $best = $event->{index};
+        }
+    }
+
+    return $best;
+}
+
+# Determina si un anchor estructural puede considerarse reciente.
+#
+# $max_distance representa la cantidad máxima de velas entre el evento
+# y el cursor. Puede ajustarse posteriormente sin tocar el motor del perfil.
+sub _avp_anchor_is_recent {
+    my ($self, $anchor, $limit, $max_distance) = @_;
+
+    $max_distance //= 1000;
+
+    return 0 unless defined $anchor;
+    return 0 unless defined $limit;
+
+    return 0 if $anchor < 0;
+    return 0 if $anchor > $limit;
+
+    my $distance = $limit - $anchor;
+
+    return $distance <= $max_distance ? 1 : 0;
+}
+
+# Fallback de contingencia para el AVP.
+# Devuelve el primer candle disponible del histórico.
+sub _session_anchor_far {
+    my ($self, $limit) = @_;
+
+    return undef unless defined $limit;
+    return undef if $limit < 0;
+
+    my $first_candle =
+        $self->{market}->get_candle(0);
+
+    return undef unless defined $first_candle;
+
+    return 0;
+}
+
 # Índice del swing pivot (major) más reciente ≤ $limit — anclaje "Dynamic Swing"
 # (de GHOST_IN_SWINGS). Reusa los swings ya detectados por SMC_Structures.
 sub _swing_anchor {
@@ -1466,6 +1618,15 @@ sub avwap_toggle_type {
 # Colores de los perfiles manuales (multipivot).
 my @AVP_COLORS = ('#5b9cff', '#f0b90b', '#ab47bc', '#26c6da', '#ff7043');
 
+# Colores para los perfiles automáticos.
+# Se mantienen separados de @AVP_COLORS porque esos colores pertenecen
+# únicamente a los perfiles anclados manualmente.
+my %AVP_AUTO_COLOR = (
+    bos         => '#089981',
+    choch       => '#f23645',
+    contingency => '#9c27b0',
+);
+
 # Recalcula el AVP respetando el modo Replay. Reconstruye la lista de perfiles
 # desde los anchors manuales y calcula cada uno (ReplayProxy en replay: historia
 # acotada al cursor, sin fuga de futuro; NO usa el WindowProxy deslizante).
@@ -1481,22 +1642,126 @@ sub _recalc_avp {
     }
 }
 
-# Construye la lista de perfiles del AVP: uno por cada anchor manual ≤ límite.
+# Construye todos los perfiles del AVP:
+# - perfiles manuales;
+# - perfil automático por BOS externo;
+# - perfil automático por CHoCH externo;
+# - perfil de contingencia.
 sub _rebuild_avp_profiles {
     my ($self, $vp) = @_;
+
     my $limit = $self->_replay_limit();
     my @specs;
-    my $i = 0;
+
+    # ================================================================
+    # 1. PERFILES MANUALES
+    # ================================================================
+
+    my $manual_index = 0;
+
     for my $idx (@{ $self->{avp_manual} }) {
+
+        # Impide utilizar anchors posteriores al cursor de Replay.
         next if $idx > $limit;
+
         push @specs, {
-            key          => "avp$i",
+            key          => "avp$manual_index",
             anchor_index => $idx,
             label        => 'AVP',
-            color        => $AVP_COLORS[$i % @AVP_COLORS],
+            color        =>
+                $AVP_COLORS[
+                    $manual_index % @AVP_COLORS
+                ],
         };
-        $i++;
+
+        $manual_index++;
     }
+
+    # ================================================================
+    # 2. PERFILES AUTOMÁTICOS BOS Y CHoCH
+    # ================================================================
+
+    my $types =
+        $self->{avp_types} // {};
+
+    my $any_auto_enabled = 0;
+    my $generated_auto   = 0;
+
+    # Un evento situado a más de 1000 velas se considera antiguo.
+    my $max_event_distance = 1000;
+
+    for my $type_key (qw(bos choch)) {
+
+        # Si el checkbox no está activo, se ignora este tipo.
+        next unless $types->{$type_key};
+
+        $any_auto_enabled = 1;
+
+        # Los eventos SMC guardan exactamente "BOS" y "CHoCH".
+        my $event_type =
+            $type_key eq 'choch'
+            ? 'CHoCH'
+            : 'BOS';
+
+        my $anchor =
+            $self->_avp_external_event_anchor(
+                $limit,
+                $event_type
+            );
+
+        # No genera un perfil normal cuando:
+        # - no existe el evento;
+        # - está después del cursor;
+        # - se encuentra demasiado lejos.
+        next unless $self->_avp_anchor_is_recent(
+            $anchor,
+            $limit,
+            $max_event_distance
+        );
+
+        push @specs, {
+            key          => "avp_auto_$type_key",
+            anchor_index => $anchor,
+            label        => $event_type,
+            color        =>
+                $AVP_AUTO_COLOR{$type_key},
+        };
+
+        $generated_auto = 1;
+    }
+
+    # ================================================================
+    # 3. CONTINGENCIA
+    # ================================================================
+
+    # La contingencia solo aparece cuando:
+    # - BOS o CHoCH está activado;
+    # - ninguno pudo generar un perfil reciente;
+    # - contingency está habilitado en el estado.
+    if (
+        $any_auto_enabled
+        && !$generated_auto
+        && $types->{contingency}
+    ) {
+        my $fallback_anchor =
+            $self->_session_anchor_far($limit);
+
+        if (
+            defined $fallback_anchor
+            && $fallback_anchor >= 0
+            && $fallback_anchor <= $limit
+        ) {
+            push @specs, {
+                key          => 'avp_contingency',
+                anchor_index => $fallback_anchor,
+                label        => 'Contingencia',
+                color        =>
+                    $AVP_AUTO_COLOR{contingency},
+            };
+        }
+    }
+
+    # Entrega toda la lista al motor existente de VolumeProfile.
     $vp->set_profiles(\@specs);
 }
 
@@ -1541,6 +1806,22 @@ sub set_avp_anchor {
 sub avp_clear {
     my ($self) = @_;
     $self->{avp_manual} = [];
+    $self->_recalc_avp();
+    $self->draw();
+}
+
+# Activa o desactiva un anclaje automático del AVP.
+sub avp_toggle_type {
+    my ($self, $key, $enabled) = @_;
+
+    return unless defined $key;
+
+    return unless exists
+        $self->{avp_types}{$key};
+
+    $self->{avp_types}{$key} =
+        $enabled ? 1 : 0;
+
     $self->_recalc_avp();
     $self->draw();
 }
