@@ -76,14 +76,46 @@ sub _draw_profile {
 
     my $y_of = sub { $scale->price_to_y($_[0], $min, $max, $top, $h) };
 
-    # Recuadro: desde el anchor (acotado al área visible) hasta el borde derecho.
-    my $anchor_x = $x_of->($prof->{anchor_index} - $start);
-    my $box_left = $anchor_x;
-    $box_left = $left  if $box_left < $left;
-    $box_left = $right if $box_left > $right;
-    my $box_w = $right - $box_left;
-    return if $box_w < 4;
-    my $max_width = $WIDTH_FRAC * $box_w;
+    # Identificar si se trata de uno de los perfiles automáticos
+# implementados para BOS, CHoCH o contingencia.
+my $profile_key = $prof->{key} // '';
+
+my $is_auto_profile =
+       $profile_key =~ /^avp_auto_/
+    || $profile_key eq 'avp_contingency';
+
+# Posición gráfica del evento que originó el perfil.
+my $anchor_x = $x_of->(
+    $prof->{anchor_index} - $start
+);
+
+# Mantener el anchor dentro del panel visible.
+my $box_left = $anchor_x;
+$box_left = $left  if $box_left < $left;
+$box_left = $right if $box_left > $right;
+
+my $box_w = $right - $box_left;
+
+# En perfiles manuales se conserva el comportamiento original:
+# si prácticamente no existe espacio desde el anchor hasta el borde,
+# no hay recuadro válido para dibujar.
+#
+# En perfiles automáticos NO se abandona el dibujo, porque sus niveles
+# POC, VAH y VAL deben mantenerse visibles en toda la temporalidad.
+return if !$is_auto_profile && $box_w < 4;
+
+# Para BOS, CHoCH y contingencia, el histograma puede utilizar como
+# referencia el ancho completo del panel visible. De esta manera,
+# aunque el evento esté cerca del borde derecho, el perfil no desaparece.
+my $profile_draw_width = $is_auto_profile
+    ? ($right - $left)
+    : $box_w;
+
+$profile_draw_width = 4
+    if $profile_draw_width < 4;
+
+my $max_width =
+    $WIDTH_FRAC * $profile_draw_width;
 
     my $mode    = $self->{mode};
     my $max_vol = $res->{max_row_vol} || 1;
@@ -139,18 +171,56 @@ sub _draw_profile {
     }
 
     # ── Líneas POC / VAH / VAL + etiquetas en la escala de precios ────────────
-    if ($self->{visible}{poc}) {
-        $self->_level_line($c, $box_left, $right, $w, $y_of->($res->{poc_price}),
-                           $res->{poc_price}, $COL{poc}, 2, 0);
-    }
-    if ($self->{visible}{vah}) {
-        $self->_level_line($c, $box_left, $right, $w, $y_of->($res->{vah}),
-                           $res->{vah}, $COL{va}, 1, 1);
-    }
-    if ($self->{visible}{val}) {
-        $self->_level_line($c, $box_left, $right, $w, $y_of->($res->{val}),
-                           $res->{val}, $COL{va}, 1, 1);
-    }
+
+# Los perfiles automáticos mantienen sus niveles en todo el ancho
+# de la temporalidad visible.
+#
+# Los perfiles manuales conservan el inicio desde su anchor.
+my $level_x0 = $is_auto_profile
+    ? $left
+    : $box_left;
+
+if ($self->{visible}{poc}) {
+    $self->_level_line(
+        $c,
+        $level_x0,
+        $right,
+        $w,
+        $y_of->($res->{poc_price}),
+        $res->{poc_price},
+        $COL{poc},
+        2,
+        0
+    );
+}
+
+if ($self->{visible}{vah}) {
+    $self->_level_line(
+        $c,
+        $level_x0,
+        $right,
+        $w,
+        $y_of->($res->{vah}),
+        $res->{vah},
+        $COL{va},
+        1,
+        1
+    );
+}
+
+if ($self->{visible}{val}) {
+    $self->_level_line(
+        $c,
+        $level_x0,
+        $right,
+        $w,
+        $y_of->($res->{val}),
+        $res->{val},
+        $COL{va},
+        1,
+        1
+    );
+}
 
     # Etiqueta del perfil junto al anchor.
     if ($box_left < $right - 20) {
